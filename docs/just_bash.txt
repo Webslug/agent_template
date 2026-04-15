@@ -1,0 +1,64 @@
+on lubuntu in lxqt how can i install just bash in the terminal?
+
+https://github.com/vercel-labs/just-bash
+
+It's known as Just Bash for agents
+
+--
+
+Installing **just-bash** on Lubuntu (which uses the LXQt desktop environment) is straightforward, as it's essentially a specialized Bash environment designed for LLM agents. Since it's a GitHub-based project, you'll be using the terminal to fetch and set it up.
+
+### Prerequisites
+Before you start, ensure you have `git` and `curl` installed. Open your terminal (**QTerminal** in LXQt) and run:
+
+```bash
+sudo apt update
+sudo apt install git curl -y
+```
+
+---
+
+### Installation Steps
+
+Depending on how you intend to use it, here are the two most common ways to get it running:
+
+#### 1. The Quick Start (Using the install script)
+The repository provides a convenient one-liner to download and set up the environment automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vercel-labs/just-bash/main/install.sh | bash
+```
+
+#### 2. Manual Installation (For customization)
+If you prefer to have the files locally so you can inspect or modify them:
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/vercel-labs/just-bash.git
+    ```
+2.  **Navigate into the directory:**
+    ```bash
+    cd just-bash
+    ```
+3.  **Run the setup:**
+    ```bash
+    ./install.sh
+    ```
+
+---
+
+### How to Use It
+Once installed, you can enter the "Just Bash" environment by simply typing:
+
+```bash
+just-bash
+```
+
+> **Note:** This tool is specifically "stripped down" to be efficient for AI agents. If you are using this to build an agentic workflow, ensure your environment variables (like API keys for Vercel or your LLM provider) are configured in your `.bashrc` or `.env` file as required by your specific project.
+
+### Why use this on Lubuntu?
+Lubuntu is already lightweight, and adding a minimal shell environment like `just-bash` makes it an excellent "sandbox" for testing AI agents without the overhead of a heavy OS. 
+
+Are you planning to use this to build a local autonomous agent, or are you connecting it to a specific web-based LLM?
+
+By the way, to unlock the full functionality of all Apps, enable [Gemini Apps Activity](https://myactivity.google.com/product/gemini).
