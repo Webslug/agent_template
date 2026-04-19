@@ -51,7 +51,8 @@ MCP_PORT = "8206"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Inject DB_PATH into agent so trip-wire reset can reach the database.
-agent.DB_PATH = DB_PATH
+agent.DB_PATH  = DB_PATH
+agent.BASE_DIR = BASE_DIR
 
 # -----------------------------------------------------------------------------
 # BOOT SEQUENCE

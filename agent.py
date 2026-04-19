@@ -45,9 +45,11 @@ import urllib.request
 import urllib.error
 
 import db
+import evolve
 
 # Injected by index.py after import so agent functions can reach the DB.
-DB_PATH = None
+DB_PATH   = None
+BASE_DIR  = None   # Injected by index.py — project root for evolve key resolution
 
 # -----------------------------------------------------------------------------
 # STAGGER REGISTRY
@@ -555,6 +557,7 @@ COMMANDS = {
     "!stagger":   "List all scheduled stagger timers and their status.",
     "!reload":    "Force a prompt reload from the database immediately.",
     "!clear":     "Clear the terminal screen.",
+    "/evolve":    "Introspect the agent and request self-improvement suggestions. Args: local | claude",
 }
 
 
@@ -732,6 +735,11 @@ def loop_interactive(runtime, build_runtime_fn):
             continue
         if user_input.lower().startswith("/stagger "):
             _dispatch_stagger(user_input, runtime, build_runtime_fn)
+            continue
+        if user_input.lower().startswith("/evolve"):
+            parts = user_input.strip().split(None, 1)
+            mode  = parts[1].strip() if len(parts) > 1 else "local"
+            evolve.dispatch_evolve(mode, DB_PATH, BASE_DIR or ".", values)
             continue
 
         print("Agent > ", end="", flush=True)
