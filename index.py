@@ -4,10 +4,27 @@
 #   - Defining static deployment constants (DB_PATH, MCP_PORT only)
 #   - Bootstrapping the database via db_seed.py if absent
 #   - Loading all runtime tables and assembling the system prompt
+#   - Resolving the active model profile and anti-prompts
 #   - Delegating execution to agent.py
 #
 # USAGE:
 #   python3 index.py
+#
+# RUNTIME TUPLE SHAPE (7 elements):
+#   (settings, values, prompts, functions, profiles, project_files, system_prompt)
+#
+#   settings      — settings_boolean rows  (binary switches)
+#   values        — settings_values rows   (endpoints, paths, ranges)
+#   prompts       — agent_prompts rows     (system prompt bodies)
+#   functions     — functions rows         (callable agent roster)
+#   profiles      — model_profiles rows    (per-architecture anti-prompts + format)
+#   project_files — project_files rows     (source files for context injection)
+#   system_prompt — assembled string       (base prompt + function digest)
+#
+# The active model profile and its anti-prompts are resolved from the profiles
+# array at boot and on every reload. agent.py reads them via:
+#   db.resolve_active_profile(profiles, active_model)
+#   db.resolve_anti_prompts(profile)
 # =============================================================================
 
 import os
@@ -28,6 +45,10 @@ import agent
 DB_PATH  = "database.db"
 MCP_PORT = "8206"
 
+# Resolve base directory so db.resolve_project_files() can locate files
+# relative to this file's location even when cwd differs.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Inject DB_PATH into agent so trip-wire reset can reach the database.
 agent.DB_PATH = DB_PATH
 
@@ -43,18 +64,43 @@ def _boot_database():
 
 def _build_runtime_state():
     """
-    Load all tables and assemble the initial system prompt.
-    Returns: (settings, values, prompts, functions, system_prompt)
+    Load all tables and assemble the full runtime state.
 
-    Called once at boot. Passed as a callable into agent.py so the
-    prompt reload trip-wire and !reload command can rebuild state without
-    creating a circular import.
+    Returns a 7-tuple:
+      (settings, values, prompts, functions, profiles, project_files, system_prompt)
+
+    Called once at boot. Passed as a callable into agent.py so the prompt
+    reload trip-wire and !reload command can rebuild state without creating
+    a circular import.
+
+    Profile resolution is performed here so agent.py can read the active
+    anti-prompts and prompt_format directly from the profiles array without
+    touching the database again.
     """
-    settings, values, prompts, functions = db.load_all_tables(DB_PATH)
+    settings, values, prompts, functions, profiles, project_files = db.load_all_tables(DB_PATH)
+
+    # Resolve active model profile — fatal if ACTIVE_MODEL has no matching row
+    active_model   = db.resolve_value(values, "ACTIVE_MODEL", fallback="GEMMA")
+    active_profile = db.resolve_active_profile(profiles, active_model)
+    anti_prompts   = db.resolve_anti_prompts(active_profile)
+
+    # Resolve project files — three-pass path search (seeded path → base_dir → cwd)
+    resolved_files = db.resolve_project_files(project_files, base_dir=BASE_DIR)
+
+    # Assemble system prompt from active prompt body + enabled function digest
     prompt_name   = db.resolve_value(values, "DEFAULT_PROMPT", fallback="DEFAULT")
     base_prompt   = db.resolve_prompt(prompts, prompt_name)
     system_prompt = db.assemble_system_prompt(base_prompt, functions)
-    return settings, values, prompts, functions, system_prompt
+
+    print(
+        f"[boot] Model: {active_model} | "
+        f"Format: {active_profile['prompt_format']} | "
+        f"Thinking: {active_profile['thinking_mode']} | "
+        f"Anti-prompts: {anti_prompts}"
+    )
+
+    return settings, values, prompts, functions, profiles, resolved_files, system_prompt
+
 
 # -----------------------------------------------------------------------------
 # MAIN
@@ -64,7 +110,7 @@ def main():
     # 1. Ensure database exists and is seeded
     _boot_database()
 
-    # 2. Load all tables, resolve active prompt, assemble system prompt
+    # 2. Load all tables, resolve active profile, assemble system prompt
     runtime  = _build_runtime_state()
     settings = runtime[0]
 

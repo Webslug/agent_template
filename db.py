@@ -6,8 +6,19 @@
 # Also owns the in-memory resolution helpers that were previously scattered
 # across index.py. Anything that touches rows or interprets their values
 # belongs here. index.py never touches sqlite3 directly.
+#
+# TABLE INVENTORY
+# ───────────────────────────────────────────────────────────────────────────
+# settings_boolean — binary switches (0 or 1)
+# settings_values  — string values, endpoints, paths, ranges
+# agent_prompts    — system prompt bodies, swappable at runtime
+# functions        — callable agent function roster
+# model_profiles   — per-architecture anti-prompts, format, thinking mode
+# project_files    — source files registered for context injection
+# agent_bash_logs  — audit trail (no fetcher needed — write-only from agent)
 # =============================================================================
 
+import os
 import sqlite3
 import sys
 
@@ -79,6 +90,32 @@ def fetch_all_functions(db_path):
     return [dict(row) for row in rows]
 
 
+def fetch_all_model_profiles(db_path):
+    """
+    Return all rows from model_profiles as a list of dicts.
+    Each row is the full operational profile for one model architecture.
+    Keys: id, profile_name, prompt_format, anti_prompts,
+          thinking_mode, endpoint_key, notes
+    """
+    conn = _connect(db_path)
+    rows = conn.execute("SELECT * FROM model_profiles").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def fetch_all_project_files(db_path):
+    """
+    Return all rows from project_files as a list of dicts.
+    Paths are resolved at load time — seeded paths are absolute but the
+    resolver will search the runtime directory if a file is missing there.
+    Keys: id, file_path, file_project
+    """
+    conn = _connect(db_path)
+    rows = conn.execute("SELECT * FROM project_files").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def fetch_function_by_name(db_path, function_name):
     """
     Retrieve a single function row by exact function_name.
@@ -96,24 +133,29 @@ def fetch_function_by_name(db_path, function_name):
 # -----------------------------------------------------------------------------
 # BULK LOADER
 # Called once at boot and again on any prompt-reload cycle.
-# Returns all four operational arrays in a single call.
+# Returns all six operational arrays in a single call.
 # -----------------------------------------------------------------------------
 
 def load_all_tables(db_path):
     """
-    Load all four operational tables into memory in one pass.
-    Returns: (settings, values, prompts, functions) as lists of dicts.
+    Load all six operational tables into memory in one pass.
+    Returns: (settings, values, prompts, functions, profiles, project_files)
+             as lists of dicts.
 
-    settings  — settings_boolean  — binary switches (0 or 1)
-    values    — settings_values   — string values, endpoints, paths, ranges
-    prompts   — agent_prompts     — system prompt bodies
-    functions — functions         — callable agent function roster
+    settings      — settings_boolean — binary switches (0 or 1)
+    values        — settings_values  — string values, endpoints, paths, ranges
+    prompts       — agent_prompts    — system prompt bodies
+    functions     — functions        — callable agent function roster
+    profiles      — model_profiles   — per-architecture anti-prompts and format
+    project_files — project_files    — registered source files for context use
     """
-    settings  = fetch_all_settings(db_path)
-    values    = fetch_all_values(db_path)
-    prompts   = fetch_all_prompts(db_path)
-    functions = fetch_all_functions(db_path)
-    return settings, values, prompts, functions
+    settings      = fetch_all_settings(db_path)
+    values        = fetch_all_values(db_path)
+    prompts       = fetch_all_prompts(db_path)
+    functions     = fetch_all_functions(db_path)
+    profiles      = fetch_all_model_profiles(db_path)
+    project_files = fetch_all_project_files(db_path)
+    return settings, values, prompts, functions, profiles, project_files
 
 # -----------------------------------------------------------------------------
 # IN-MEMORY RESOLVERS
@@ -155,6 +197,99 @@ def resolve_prompt(prompts, prompt_name):
 
     print(f"[db] FATAL — prompt '{prompt_name}' not found or disabled.", file=sys.stderr)
     sys.exit(1)
+
+
+def resolve_active_profile(profiles, active_model):
+    """
+    Locate and return the model_profiles row whose profile_name matches
+    active_model (case-insensitive). Returns the dict on success.
+
+    Exits fatally if the profile is missing — an unrecognised model label
+    is a misconfiguration, not a recoverable runtime condition.
+    The profile dict is the single source of truth for:
+      - anti_prompts  (comma-delimited stop sequences)
+      - prompt_format (gemma | chatml | llama3 | mistral | phi3)
+      - thinking_mode (0 or 1)
+      - endpoint_key  (pointer into settings_values)
+    """
+    for row in profiles:
+        if row["profile_name"].upper() == active_model.upper():
+            return row
+
+    known = [r["profile_name"] for r in profiles]
+    print(
+        f"[db] FATAL — no model profile found for '{active_model}'. "
+        f"Known profiles: {known}",
+        file=sys.stderr
+    )
+    sys.exit(1)
+
+
+def resolve_anti_prompts(profile):
+    """
+    Parse the anti_prompts field of a resolved profile dict into a clean list.
+
+    The stored value is comma-delimited. The literal token '\\n\\n\\n' is
+    normalised to a real triple-newline so Kobold receives the correct bytes.
+    Empty tokens produced by trailing commas are filtered out.
+
+    Returns a list of strings ready to pass directly to the Kobold payload.
+    """
+    raw = profile.get("anti_prompts", "")
+    tokens = [t.replace("\\n", "\n") for t in raw.split(",") if t.strip()]
+    return tokens
+
+
+def resolve_project_files(project_files, base_dir=None):
+    """
+    Resolve the registered project_files rows into a list of dicts, each
+    augmented with a 'resolved_path' key containing the best available
+    filesystem path for that file.
+
+    Resolution order for each entry:
+      1. The seeded file_path as-is — used if the file exists there.
+      2. The bare filename joined to base_dir — handles deployments where
+         the project has been moved to a different root directory.
+      3. The bare filename joined to the current working directory.
+      4. Unresolvable — resolved_path is set to None and a warning is printed.
+
+    base_dir — typically os.path.dirname(os.path.abspath(__file__)) from
+               index.py, passed in so this module stays import-free of index.
+    """
+    resolved = []
+    for row in project_files:
+        entry        = dict(row)
+        seeded_path  = row["file_path"]
+        filename     = os.path.basename(seeded_path)
+        found        = None
+
+        # Pass 1 — seeded absolute path
+        if os.path.isfile(seeded_path):
+            found = seeded_path
+
+        # Pass 2 — filename relative to the caller's directory
+        if found is None and base_dir:
+            candidate = os.path.join(base_dir, filename)
+            if os.path.isfile(candidate):
+                found = candidate
+
+        # Pass 3 — filename relative to cwd
+        if found is None:
+            candidate = os.path.join(os.getcwd(), filename)
+            if os.path.isfile(candidate):
+                found = candidate
+
+        if found is None:
+            print(
+                f"[db] WARNING — project file not found: '{seeded_path}' "
+                f"(also tried '{filename}' relative to runtime dir)",
+                file=sys.stderr
+            )
+
+        entry["resolved_path"] = found
+        resolved.append(entry)
+
+    return resolved
 
 # -----------------------------------------------------------------------------
 # PROMPT ASSEMBLER

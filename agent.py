@@ -370,7 +370,7 @@ def _dispatch_command(raw_input, runtime, build_runtime_fn):
     build_runtime_fn is passed in from index.py to avoid a circular import.
     Commands are local only — Kobold never sees them.
     """
-    settings, values, prompts, functions, system_prompt = runtime
+    settings, values, prompts, functions, profiles, project_files, system_prompt = runtime
     token = raw_input.strip().lower()
 
     if token == "!help":
@@ -469,7 +469,7 @@ def loop_interactive(runtime, build_runtime_fn):
     Commands beginning with '!' are intercepted and handled locally.
     Checks PROMPT_RELOAD at the top of every turn for seamless hot-swaps.
 
-    runtime          — 5-tuple: (settings, values, prompts, functions, system_prompt)
+    runtime          — 7-tuple: (settings, values, prompts, functions, profiles, project_files, system_prompt)
     build_runtime_fn — callable from index.py that reloads all tables and
                        reassembles the system prompt; passed to avoid circular import.
     """
@@ -477,7 +477,7 @@ def loop_interactive(runtime, build_runtime_fn):
 
     while True:
         runtime  = _check_prompt_reload(runtime, build_runtime_fn)
-        settings, values, prompts, functions, system_prompt = runtime
+        settings, values, prompts, functions, profiles, project_files, system_prompt = runtime
 
         try:
             user_input = input("You > ").strip()
@@ -508,7 +508,7 @@ def loop_stateless(runtime, build_runtime_fn):
     """
     while True:
         runtime  = _check_prompt_reload(runtime, build_runtime_fn)
-        settings, values, _, functions, system_prompt = runtime
+        settings, values, _, functions, profiles, project_files, system_prompt = runtime
 
         line = sys.stdin.readline()
         if not line:
