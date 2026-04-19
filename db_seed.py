@@ -366,6 +366,8 @@ SEED_PROMPTS = [
             "  - Staggered tasks exist only in memory — they are lost if the process exits.\n"
             "  - You may issue /stagger directives yourself when a task should be deferred\n"
             "    rather than executed immediately (e.g. cooldown periods, retry scheduling).\n"
+            "  - When you emit a /stagger directive as your FINAL answer, the system WILL\n"
+            "    arm the timer automatically. Do not narrate it — just emit the directive.\n"
             "  - Never use /stagger to avoid a task — only use it when timing genuinely matters.\n\n"
 
             "════════════════════════════════════════\n"
@@ -413,6 +415,9 @@ SEED_PROMPTS = [
 
             "User: /stagger 5 show me the bash log\n"
             "FINAL: Command staggered. I will fetch the bash log in 5 minutes.\n\n"
+
+            "User: tell me the time in 1 minute\n"
+            "FINAL: /stagger 1 tell me the time\n\n"
 
             "Available functions:"
         ),

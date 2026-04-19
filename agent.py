@@ -736,7 +736,14 @@ def loop_interactive(runtime, build_runtime_fn):
 
         print("Agent > ", end="", flush=True)
         response = _agent_turn(system_prompt, user_input, functions, values, settings)
-        print(f"{response}\n")
+
+        # Intercept agent-emitted /stagger directives — the agent reasons about
+        # scheduling and emits the directive as its FINAL: answer. We catch it
+        # here and arm the timer, then confirm to the operator.
+        if response.strip().lower().startswith("/stagger "):
+            _dispatch_stagger(response.strip(), runtime, build_runtime_fn)
+        else:
+            print(f"{response}\n")
 
 
 def loop_stateless(runtime, build_runtime_fn):
