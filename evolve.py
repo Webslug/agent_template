@@ -57,7 +57,7 @@ EVOLVE_CLAUDE_API_URL   = "https://api.anthropic.com/v1/messages"
 EVOLVE_CLAUDE_MAX_TOKENS = 1500
 
 EVOLVE_KOBOLD_MAX_TOKENS  = 900
-EVOLVE_KOBOLD_TEMPERATURE = 0.3    # slightly warmer than default for ideation
+EVOLVE_KOBOLD_TEMPERATURE = 0.15   # lower temperature helps Gemma stay on task
 EVOLVE_KOBOLD_TOP_P       = 0.9
 
 EVOLVE_BASH_LOG_LIMIT   = 10       # recent audit entries included in snapshot
@@ -195,6 +195,194 @@ def _build_evolve_prompt(snapshot):
         "────────────────────────────────────────────────────────────────\n"
         "BEGIN RECOMMENDATIONS:\n"
     )
+
+
+def _build_local_evolve_prompt(snapshot):
+    """
+    A stricter, shorter prompt for the local Gemma path.
+
+    Claude can handle looser instructions. Gemma benefits from a tighter
+    output contract with fewer degrees of freedom and explicit anti-patterns.
+    """
+    return (
+        "You are reviewing a mostly complete local AI agent project.\n"
+        "Your job is to identify the next most useful engineering work.\n\n"
+        "Write plain text only. Do not use code fences, tables, roleplay, or ellipses.\n"
+        "Do not invent missing items that are already present in the snapshot.\n"
+        "Do not repeat the snapshot back to me.\n"
+        "Be concrete and concise.\n\n"
+        "Use exactly this structure:\n"
+        "1. <highest priority gap> - why it matters - what to do next\n"
+        "2. <next gap> - why it matters - what to do next\n"
+        "3. <next gap> - why it matters - what to do next\n"
+        "4. <next gap> - why it matters - what to do next\n"
+        "5. <next gap> - why it matters - what to do next\n\n"
+        "Prioritize real implementation gaps in this order:\n"
+        "- missing functions\n"
+        "- missing settings\n"
+        "- missing harness rules\n"
+        "- brittle function behavior\n"
+        "- architectural cleanup\n\n"
+        "If evidence is weak, say so briefly instead of hallucinating.\n\n"
+        "AGENT SNAPSHOT\n"
+        "────────────────────────────────────────────────────────────────\n"
+        f"{snapshot}\n"
+        "────────────────────────────────────────────────────────────────\n"
+        "BEGIN REPORT:\n"
+    )
+
+
+def _is_low_quality_response(response):
+    """
+    Detect obviously unusable local model output.
+
+    We only use this for the local /evolve path. Claude output is left alone.
+    """
+    if not response:
+        return True
+
+    text = response.strip()
+    if len(text) < 120:
+        return True
+
+    lowered = text.lower()
+    if "```" in text:
+        return True
+    if "..." in text:
+        return True
+    if "[priority" in lowered:
+        return True
+
+    numbered_lines = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped[:1].isdigit() and "." in stripped[:3]:
+            numbered_lines += 1
+    return numbered_lines < 3
+
+
+def _build_local_fallback_report(db_path):
+    """
+    Deterministic fallback used when the local model response is unusable.
+
+    The goal is to still return a salient /evolve report instead of saving
+    obvious gibberish when Gemma drifts.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        function_names = {
+            row[0] for row in conn.execute(
+                "SELECT function_name FROM functions WHERE function_enabled = 1"
+            ).fetchall()
+        }
+        boolean_names = {
+            row[0] for row in conn.execute(
+                "SELECT setting_name FROM settings_boolean"
+            ).fetchall()
+        }
+        value_names = {
+            row[0] for row in conn.execute(
+                "SELECT setting_name FROM settings_values"
+            ).fetchall()
+        }
+        harness_names = {
+            row[0] for row in conn.execute(
+                "SELECT harness_name FROM harnesses WHERE harness_enabled = 1"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    suggestions = []
+
+    def add(title, rationale, next_step):
+        suggestions.append((title, rationale, next_step))
+
+    if "get_function_body" not in function_names:
+        add(
+            "Add get_function_body",
+            "The agent can inspect and list functions, but it cannot read an existing body for debugging or review.",
+            "Implement a read-only function that returns the full body for a named function."
+        )
+    if "delete_function" not in function_names:
+        add(
+            "Add delete_function",
+            "There is no supported path for cleanly removing obsolete functions once they become harmful or redundant.",
+            "Add a deletion helper that requires explicit confirmation and logs the removal reason."
+        )
+    if "get_bash_log_filtered" not in function_names:
+        add(
+            "Add get_bash_log_filtered",
+            "The current bash-log view is likely too coarse for daemon and cron troubleshooting.",
+            "Support filters for exit code, command text, and time window so operators can inspect failures faster."
+        )
+    if "health_check" not in function_names:
+        add(
+            "Add health_check",
+            "The agent needs a cheap probe for model endpoints when running unattended.",
+            "Return endpoint status and latency for Kobold and Ollama before the next runtime issue becomes a mystery."
+        )
+    if "restart_service" not in function_names:
+        add(
+            "Add restart_service",
+            "A daemon-oriented agent should be able to recover a failed backend without manual intervention.",
+            "Add a guarded service restart helper with a small whitelist of allowed service names."
+        )
+
+    if "BASH_TIMEOUT_SECONDS" not in value_names:
+        add(
+            "Add BASH_TIMEOUT_SECONDS",
+            "Bash execution timeouts should be operator-configurable instead of hard-coded.",
+            "Seed a sane range like 5 to 300 seconds and read it at runtime."
+        )
+    if "LOG_RETENTION_DAYS" not in value_names:
+        add(
+            "Add LOG_RETENTION_DAYS",
+            "The audit log will keep growing unless the retention policy is explicit.",
+            "Store a retention window in settings_values and prune old rows on a schedule."
+        )
+    if "HEALTH_CHECK_INTERVAL_SECONDS" not in value_names:
+        add(
+            "Add HEALTH_CHECK_INTERVAL_SECONDS",
+            "Health probes should be schedulable without code changes.",
+            "Keep the polling cadence in settings_values so daemon and cron deployments can tune it."
+        )
+    if "DRY_RUN_MODE" not in boolean_names:
+        add(
+            "Add DRY_RUN_MODE",
+            "Safe testing is hard if destructive actions always execute for real.",
+            "Use a boolean guard that logs intent but suppresses writes and shell execution."
+        )
+
+    if "BASH_NO_NETWORK_EXPOSURE" not in harness_names:
+        add(
+            "Add BASH_NO_NETWORK_EXPOSURE",
+            "The current harness set protects against destructive shell commands, but not data exfiltration.",
+            "Deny curl, wget, nc, scp, and similar tools unless an allowlist explicitly permits them."
+        )
+    if "FUNCTION_SCHEMA_VALIDATION" not in harness_names:
+        add(
+            "Add FUNCTION_SCHEMA_VALIDATION",
+            "Upserted function bodies should be sanity-checked before execution time.",
+            "Validate bodies with AST checks and reject obvious hazards before they enter the roster."
+        )
+
+    if not suggestions:
+        suggestions.append((
+            "Tighten observability",
+            "The current snapshot does not expose an obvious missing capability, so the best gains are likely operational.",
+            "Focus next on logging, health checks, and prompt quality improvements."
+        ))
+
+    lines = [
+        "LOCAL FALLBACK REPORT",
+        "The local model output was unusable, so this deterministic report was generated from the live database snapshot.",
+        ""
+    ]
+    for idx, (title, rationale, next_step) in enumerate(suggestions[:5], start=1):
+        lines.append(f"{idx}. {title} - {rationale} {next_step}")
+
+    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------------
@@ -359,7 +547,7 @@ def dispatch_evolve(mode, db_path, base_dir, values):
     print(f"  [evolve] Building database snapshot...")
 
     snapshot = _build_snapshot(db_path)
-    prompt   = _build_evolve_prompt(snapshot)
+    prompt   = _build_local_evolve_prompt(snapshot) if mode == "local" else _build_evolve_prompt(snapshot)
 
     if mode == "claude":
         print(f"  [evolve] Dispatching to Claude Haiku ({EVOLVE_CLAUDE_MODEL})...")
@@ -379,6 +567,9 @@ def dispatch_evolve(mode, db_path, base_dir, values):
     if response.startswith("[ERROR]"):
         print(f"  [evolve] {response}\n")
     else:
+        if mode == "local" and _is_low_quality_response(response):
+            print("  [evolve] Local response looked unusable; generating fallback report.")
+            response = _build_local_fallback_report(db_path)
         print(f"  [evolve] Response received ({len(response)} chars).")
         _write_output(response, output_file, base_dir, mode)
         # Print a brief preview so the operator gets immediate value
