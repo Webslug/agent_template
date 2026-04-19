@@ -15,6 +15,7 @@
 # functions        — callable agent function roster
 # model_profiles   — per-architecture anti-prompts, format, thinking mode
 # project_files    — source files registered for context injection
+# harnesses        — operator constraints injected into the system prompt
 # agent_bash_logs  — audit trail (no fetcher needed — write-only from agent)
 # =============================================================================
 
@@ -116,6 +117,19 @@ def fetch_all_project_files(db_path):
     return [dict(row) for row in rows]
 
 
+def fetch_all_harnesses(db_path):
+    """
+    Return all rows from harnesses as a list of dicts.
+    Only enabled rows (harness_enabled=1) are meaningful to the assembler,
+    but all rows are returned so callers can inspect the full roster.
+    Keys: id, harness_name, harness_rule, harness_enabled
+    """
+    conn = _connect(db_path)
+    rows = conn.execute("SELECT * FROM harnesses").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def fetch_function_by_name(db_path, function_name):
     """
     Retrieve a single function row by exact function_name.
@@ -133,13 +147,13 @@ def fetch_function_by_name(db_path, function_name):
 # -----------------------------------------------------------------------------
 # BULK LOADER
 # Called once at boot and again on any prompt-reload cycle.
-# Returns all six operational arrays in a single call.
+# Returns all seven operational arrays in a single call.
 # -----------------------------------------------------------------------------
 
 def load_all_tables(db_path):
     """
-    Load all six operational tables into memory in one pass.
-    Returns: (settings, values, prompts, functions, profiles, project_files)
+    Load all seven operational tables into memory in one pass.
+    Returns: (settings, values, prompts, functions, profiles, project_files, harnesses)
              as lists of dicts.
 
     settings      — settings_boolean — binary switches (0 or 1)
@@ -148,6 +162,7 @@ def load_all_tables(db_path):
     functions     — functions        — callable agent function roster
     profiles      — model_profiles   — per-architecture anti-prompts and format
     project_files — project_files    — registered source files for context use
+    harnesses     — harnesses        — operator constraints for prompt injection
     """
     settings      = fetch_all_settings(db_path)
     values        = fetch_all_values(db_path)
@@ -155,7 +170,8 @@ def load_all_tables(db_path):
     functions     = fetch_all_functions(db_path)
     profiles      = fetch_all_model_profiles(db_path)
     project_files = fetch_all_project_files(db_path)
-    return settings, values, prompts, functions, profiles, project_files
+    harnesses     = fetch_all_harnesses(db_path)
+    return settings, values, prompts, functions, profiles, project_files, harnesses
 
 # -----------------------------------------------------------------------------
 # IN-MEMORY RESOLVERS
@@ -293,20 +309,40 @@ def resolve_project_files(project_files, base_dir=None):
 
 # -----------------------------------------------------------------------------
 # PROMPT ASSEMBLER
-# Combines the base prompt body with the enabled function digest.
+# Combines the base prompt body with the enabled function digest and the
+# active harness CONSTRAINTS block.
 # Owned here because it interprets DB-sourced data into a deployable string.
 # -----------------------------------------------------------------------------
 
-def assemble_system_prompt(base_prompt, functions):
+def assemble_system_prompt(base_prompt, functions, harnesses=None):
     """
-    Assemble the full system prompt:
+    Assemble the full system prompt in three parts:
+
       Part 1 — base prompt body (standing orders from agent_prompts)
       Part 2 — sequential digest of enabled function names + descriptions
+      Part 3 — CONSTRAINTS block from enabled harness rules (if any)
+
+    harnesses is optional — callers that have not yet loaded the table
+    (legacy paths, unit tests) can omit it and get a constraints-free prompt.
 
     Called at boot and again after any prompt-reload cycle.
     """
     lines = [base_prompt, ""]
-    enabled = [f for f in functions if f["function_enabled"]]
-    for fn in enabled:
+
+    # Part 2 — function digest
+    enabled_fns = [f for f in functions if f["function_enabled"]]
+    for fn in enabled_fns:
         lines.append(f"- {fn['function_name']}: {fn['function_description']}")
+
+    # Part 3 — harness constraints block
+    if harnesses:
+        active_rules = [h["harness_rule"] for h in harnesses if h["harness_enabled"]]
+        if active_rules:
+            lines.append("")
+            lines.append("════════════════════════════════════════")
+            lines.append("CONSTRAINTS — OPERATOR HARNESS (NON-NEGOTIABLE)")
+            lines.append("════════════════════════════════════════")
+            for rule in active_rules:
+                lines.append(f"- {rule}")
+
     return "\n".join(lines)

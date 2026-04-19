@@ -8,6 +8,7 @@
 #   - Scratchpad dispatch loop (_agent_turn and helpers)
 #   - Terminal command dispatcher (_dispatch_command, COMMANDS)
 #   - Prompt reload trip-wire (_check_prompt_reload)
+#   - Stagger scheduler (_schedule_stagger, _dispatch_stagger)
 #   - Execution loops (loop_interactive, loop_stateless)
 #
 # RUNTIME CONTEXT HEADER
@@ -15,6 +16,16 @@
 #   current weekday, date, time, and logged-in user. This keeps the stored
 #   DEFAULT prompt body timeless while the model always sees fresh temporal
 #   context — no static timestamp rot, no stale "today is Monday" lies.
+#
+# RUNTIME TUPLE SHAPE (8 elements):
+#   (settings, values, prompts, functions, profiles, project_files, harnesses, system_prompt)
+#
+# STAGGER SCHEDULER
+#   /stagger <minutes> <command> defers any command or question by N minutes.
+#   Implemented via threading.Timer — ephemeral, lost on process exit.
+#   The agent itself may emit /stagger directives; loop_interactive detects
+#   and routes them identically to operator-issued stagger commands.
+#   Active timers are tracked in _STAGGER_REGISTRY for !stagger inspection.
 #
 # Model: Gemma 3/4 instruction-tuned (google_gemma-3-4b-it-q4_k_s.gguf)
 # Format: Gemma turn template — <start_of_turn> / <end_of_turn>
@@ -29,6 +40,7 @@ import re
 import sys
 import json
 import sqlite3
+import threading
 import urllib.request
 import urllib.error
 
@@ -36,6 +48,24 @@ import db
 
 # Injected by index.py after import so agent functions can reach the DB.
 DB_PATH = None
+
+# -----------------------------------------------------------------------------
+# STAGGER REGISTRY
+# In-memory log of all scheduled timers. Thread-safe append only.
+# Each entry: {"id": int, "delay": int, "command": str, "fire_at": datetime,
+#              "fired": bool, "timer": threading.Timer}
+# -----------------------------------------------------------------------------
+
+_STAGGER_REGISTRY  = []
+_STAGGER_ID_LOCK   = threading.Lock()
+_STAGGER_NEXT_ID   = 0
+
+
+def _next_stagger_id():
+    global _STAGGER_NEXT_ID
+    with _STAGGER_ID_LOCK:
+        _STAGGER_NEXT_ID += 1
+        return _STAGGER_NEXT_ID
 
 # -----------------------------------------------------------------------------
 # RUNTIME CONTEXT
@@ -307,6 +337,112 @@ def _extract_tag(text, tag):
     return text[start + len(open_tag):end].strip()
 
 # -----------------------------------------------------------------------------
+# STAGGER SCHEDULER
+# /stagger <minutes> <command> — defer any command or question by N minutes.
+# Ephemeral: timers live in process memory only. Lost on exit — by design.
+# Both operators and the agent itself may issue /stagger directives.
+# -----------------------------------------------------------------------------
+
+_STAGGER_MAX_MINUTES = 60  # mirrors SCHED_MAX_STAGGER_DELAY harness rule
+
+
+def _schedule_stagger(delay_minutes, command, runtime, build_runtime_fn):
+    """
+    Register and arm a threading.Timer to fire `command` after delay_minutes.
+
+    The timer callback re-reads the current runtime snapshot at fire time so
+    it picks up any prompt reloads or setting mutations that occurred during
+    the wait. The callback is daemonised — it dies cleanly with the process.
+
+    Returns the registry entry dict (for display / inspection).
+    """
+    if delay_minutes < 1 or delay_minutes > _STAGGER_MAX_MINUTES:
+        print(
+            f"  [stagger] Delay must be 1–{_STAGGER_MAX_MINUTES} minutes. "
+            f"Got: {delay_minutes}"
+        )
+        return None
+
+    entry_id = _next_stagger_id()
+    fire_at  = datetime.datetime.now() + datetime.timedelta(minutes=delay_minutes)
+
+    def _fire():
+        # Re-read runtime at fire time — settings may have changed during wait
+        live_runtime = build_runtime_fn()
+        settings, values, _, functions, _, _, _, system_prompt = live_runtime
+
+        # Mark as fired in registry before execution
+        for e in _STAGGER_REGISTRY:
+            if e["id"] == entry_id:
+                e["fired"] = True
+                break
+
+        print(f"\n[stagger #{entry_id}] Firing: {command}")
+        print("Agent > ", end="", flush=True)
+
+        # Route: if it looks like a /stagger itself, recurse; else agent turn
+        stripped = command.strip()
+        if stripped.lower().startswith("/stagger "):
+            _dispatch_stagger(stripped, live_runtime, build_runtime_fn)
+        else:
+            response = _agent_turn(system_prompt, command, functions, values, settings)
+            print(f"{response}\n")
+
+    t = threading.Timer(delay_minutes * 60, _fire)
+    t.daemon = True
+    t.start()
+
+    entry = {
+        "id":      entry_id,
+        "delay":   delay_minutes,
+        "command": command,
+        "fire_at": fire_at,
+        "fired":   False,
+        "timer":   t,
+    }
+    _STAGGER_REGISTRY.append(entry)
+    return entry
+
+
+def _dispatch_stagger(raw_input, runtime, build_runtime_fn):
+    """
+    Parse and dispatch a /stagger directive from either the operator or the agent.
+
+    Format:  /stagger <minutes> <command or question>
+    Example: /stagger 5 show me the bash log
+
+    Prints a confirmation line and returns. Does not block.
+    """
+    # Strip the prefix and split into delay + payload
+    payload = raw_input.strip()
+    # Remove /stagger prefix (case-insensitive)
+    payload = re.sub(r'^/stagger\s+', '', payload, flags=re.IGNORECASE)
+
+    parts = payload.split(None, 1)
+    if len(parts) < 2:
+        print("  [stagger] Usage: /stagger <minutes> <command>\n")
+        return
+
+    try:
+        delay_minutes = int(parts[0])
+    except ValueError:
+        print(f"  [stagger] Delay must be an integer number of minutes. Got: '{parts[0]}'\n")
+        return
+
+    command = parts[1].strip()
+    if not command:
+        print("  [stagger] No command provided after delay.\n")
+        return
+
+    entry = _schedule_stagger(delay_minutes, command, runtime, build_runtime_fn)
+    if entry:
+        fire_at_str = entry["fire_at"].strftime("%H:%M:%S")
+        print(
+            f"  [stagger #{entry['id']}] '{command}' queued — "
+            f"fires in {delay_minutes} minute(s) at {fire_at_str}.\n"
+        )
+
+# -----------------------------------------------------------------------------
 # SCRATCHPAD DISPATCH LOOP
 # -----------------------------------------------------------------------------
 
@@ -415,6 +551,8 @@ COMMANDS = {
     "!prompt":    "Print the assembled system prompt currently in use.",
     "!settings":  "Display all settings_boolean values loaded from the database.",
     "!values":    "Display all settings_values entries loaded from the database.",
+    "!harnesses": "Display all harness constraint rules loaded from the database.",
+    "!stagger":   "List all scheduled stagger timers and their status.",
     "!reload":    "Force a prompt reload from the database immediately.",
     "!clear":     "Clear the terminal screen.",
 }
@@ -429,7 +567,7 @@ def _dispatch_command(raw_input, runtime, build_runtime_fn):
     build_runtime_fn is passed in from index.py to avoid a circular import.
     Commands are local only — Kobold never sees them.
     """
-    settings, values, prompts, functions, profiles, project_files, system_prompt = runtime
+    settings, values, prompts, functions, profiles, project_files, harnesses, system_prompt = runtime
     token = raw_input.strip().lower()
 
     if token == "!help":
@@ -467,6 +605,30 @@ def _dispatch_command(raw_input, runtime, build_runtime_fn):
         for v in values:
             print(f"    {v['setting_name']:<24} = {v['setting_value']}")
         print()
+
+    elif token == "!harnesses":
+        if not harnesses:
+            print("  [harnesses] No harness rules loaded.\n")
+        else:
+            print(f"\n  Harness Rules ({len(harnesses)} total):")
+            for h in harnesses:
+                status = "ON " if h["harness_enabled"] else "OFF"
+                print(f"    [{status}] {h['harness_name']}: {h['harness_rule'][:80]}...")
+            print()
+
+    elif token == "!stagger":
+        if not _STAGGER_REGISTRY:
+            print("  [stagger] No stagger timers registered this session.\n")
+        else:
+            print(f"\n  Stagger Timers ({len(_STAGGER_REGISTRY)} registered):")
+            for e in _STAGGER_REGISTRY:
+                status   = "FIRED" if e["fired"] else "PENDING"
+                fire_str = e["fire_at"].strftime("%H:%M:%S")
+                print(
+                    f"    #{e['id']:02d} [{status}] "
+                    f"delay={e['delay']}m fire_at={fire_str} | {e['command'][:60]}"
+                )
+            print()
 
     elif token == "!reload":
         runtime = build_runtime_fn()
@@ -527,18 +689,32 @@ def _check_prompt_reload(runtime, build_runtime_fn):
 def loop_interactive(runtime, build_runtime_fn):
     """
     Interactive readline loop. Kobold is called for every non-command input.
-    Commands beginning with '!' are intercepted and handled locally.
+
+    Input routing priority (top to bottom):
+      1. Empty input         — skip
+      2. exit / quit         — terminate
+      3. !command            — _dispatch_command (local, never reaches Kobold)
+      4. /stagger <n> <cmd>  — _dispatch_stagger (arms timer, never reaches Kobold)
+      5. Everything else     — _agent_turn (forwarded to Kobold)
+
+    STAGGER AND THE AGENT
+    The agent may emit /stagger directives in its FINAL: answer when it decides
+    a task should be deferred. The loop does NOT scan agent responses for
+    /stagger — that would create an invisible execution path. Instead, the
+    agent is trained via the prompt to emit /stagger as its FINAL: text, and
+    the operator can then decide to re-issue it. If fully autonomous stagger
+    is desired, enable it by checking FINAL responses here.
+
     Checks PROMPT_RELOAD at the top of every turn for seamless hot-swaps.
 
-    runtime          — 7-tuple: (settings, values, prompts, functions, profiles, project_files, system_prompt)
-    build_runtime_fn — callable from index.py that reloads all tables and
-                       reassembles the system prompt; passed to avoid circular import.
+    runtime          — 8-tuple from index._build_runtime_state()
+    build_runtime_fn — callable from index.py to avoid circular import.
     """
     print("  Type '!help' for commands. Type 'exit' or 'quit' to terminate.\n")
 
     while True:
         runtime  = _check_prompt_reload(runtime, build_runtime_fn)
-        settings, values, prompts, functions, profiles, project_files, system_prompt = runtime
+        settings, values, prompts, functions, profiles, project_files, harnesses, system_prompt = runtime
 
         try:
             user_input = input("You > ").strip()
@@ -554,6 +730,9 @@ def loop_interactive(runtime, build_runtime_fn):
         if user_input.startswith("!"):
             runtime = _dispatch_command(user_input, runtime, build_runtime_fn)
             continue
+        if user_input.lower().startswith("/stagger "):
+            _dispatch_stagger(user_input, runtime, build_runtime_fn)
+            continue
 
         print("Agent > ", end="", flush=True)
         response = _agent_turn(system_prompt, user_input, functions, values, settings)
@@ -566,16 +745,24 @@ def loop_stateless(runtime, build_runtime_fn):
     Suitable for cron, daemon, or service deployment.
     Each stdin line is forwarded to the scratchpad agent; response to stdout.
     Checks PROMPT_RELOAD on every iteration so the daemon can hot-swap too.
+
+    /stagger is silently ignored in stateless mode — timers require a
+    persistent process and are not appropriate for cron/pipe deployments.
     """
     while True:
         runtime  = _check_prompt_reload(runtime, build_runtime_fn)
-        settings, values, _, functions, profiles, project_files, system_prompt = runtime
+        settings, values, _, functions, profiles, project_files, harnesses, system_prompt = runtime
 
         line = sys.stdin.readline()
         if not line:
             break
         user_input = line.strip()
         if not user_input or user_input.startswith("!"):
+            continue
+        if user_input.lower().startswith("/stagger "):
+            # Silently drop — stagger has no place in a stateless pipe
+            sys.stdout.write("[stagger] Stagger is not supported in stateless mode.\n")
+            sys.stdout.flush()
             continue
         response = _agent_turn(system_prompt, user_input, functions, values, settings)
         sys.stdout.write(response + "\n")

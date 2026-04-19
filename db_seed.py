@@ -161,6 +161,29 @@ SCHEMA = [
         # file_project — logical group label; enables multi-project deployments
         #                sharing one database without cross-contamination.
     ),
+    (
+        "harnesses",
+        """
+        CREATE TABLE IF NOT EXISTS harnesses (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            harness_name     TEXT    UNIQUE NOT NULL,
+            harness_rule     TEXT    NOT NULL,
+            harness_enabled  INTEGER DEFAULT 1
+        )
+        """
+        # harness_name    — short identifier for this constraint (e.g. "MAX_FUNCTIONS")
+        # harness_rule    — full plain-English rule injected into the system prompt
+        # harness_enabled — 0 = dormant, 1 = active; only enabled rows are injected
+        #
+        # ENFORCEMENT MODEL (two tiers):
+        #   Tier 1 (current) — prompt injection: rules are appended as a
+        #     CONSTRAINTS block in the assembled system prompt. The model reads
+        #     them as standing orders and is expected to self-enforce.
+        #   Tier 2 (future)  — dispatcher enforcement: _execute_function() in
+        #     agent.py can consult this table before running a function call and
+        #     hard-block violations before they reach exec(). Implement when
+        #     autonomous operation demands hard guarantees rather than soft guidance.
+    ),
 ]
 
 # -----------------------------------------------------------------------------
@@ -329,6 +352,23 @@ SEED_PROMPTS = [
             "7. Once a RESULT has been received for a given CALL, never issue that exact CALL again — proceed to FINAL.\n\n"
 
             "════════════════════════════════════════\n"
+            "STAGGER DIRECTIVE — DEFERRED EXECUTION\n"
+            "════════════════════════════════════════\n"
+            "You may defer any command by prefixing it with /stagger <minutes>.\n"
+            "Format:\n"
+            "  /stagger <minutes> <command or question>\n\n"
+            "Examples:\n"
+            "  /stagger 5 show me the bash log\n"
+            "  /stagger 10 what is the disk usage?\n"
+            "  /stagger 2 run_bash_command expr=df -h\n\n"
+            "Rules:\n"
+            "  - The deferred command runs exactly as if typed after the delay.\n"
+            "  - Staggered tasks exist only in memory — they are lost if the process exits.\n"
+            "  - You may issue /stagger directives yourself when a task should be deferred\n"
+            "    rather than executed immediately (e.g. cooldown periods, retry scheduling).\n"
+            "  - Never use /stagger to avoid a task — only use it when timing genuinely matters.\n\n"
+
+            "════════════════════════════════════════\n"
             "AUTONOMY DIRECTIVE — STANDING ORDERS\n"
             "════════════════════════════════════════\n"
             "You are a self-improving agent. When a task is complete or idle turns arise:\n\n"
@@ -371,8 +411,77 @@ SEED_PROMPTS = [
             "RESULT: total 48\n-rw-r--r-- 1 kim kim 4096 ...\n"
             "FINAL: The current directory contains the following files: ...\n\n"
 
+            "User: /stagger 5 show me the bash log\n"
+            "FINAL: Command staggered. I will fetch the bash log in 5 minutes.\n\n"
+
             "Available functions:"
         ),
+        1
+    ),
+]
+
+# Each entry: (harness_name, harness_rule, harness_enabled)
+#
+# Rules are plain-English constraints injected verbatim into the CONSTRAINTS
+# block of the assembled system prompt. The model treats them as standing orders.
+#
+# NAMING CONVENTION:
+#   Use SCREAMING_SNAKE prefixed by domain:
+#     ROSTER_*    — constraints on the functions table
+#     BASH_*      — constraints on run_bash_command usage
+#     PROMPT_*    — constraints on agent_prompts mutations
+#     SELF_*      — constraints on self-modification behaviour
+#     SCHED_*     — constraints on /stagger and deferred execution
+#
+# ENFORCEMENT TIERS:
+#   Current  — prompt injection only (Tier 1 / soft enforcement)
+#   Future   — _execute_function() dispatcher check (Tier 2 / hard enforcement)
+SEED_HARNESSES = [
+    (
+        "ROSTER_MAX_FUNCTIONS",
+        "Never add more than 30 functions to the roster. Before calling upsert_function, "
+        "call list_functions to count enabled entries. If the count is at or above 30, "
+        "refuse and report the limit to the user.",
+        1
+    ),
+    (
+        "ROSTER_NO_SILENT_DELETE",
+        "Never disable or delete a function without logging the reason. "
+        "Always call run_bash_command to write a brief justification to the audit log "
+        "before any function removal.",
+        1
+    ),
+    (
+        "BASH_NO_DESTRUCTIVE_FLAGS",
+        "Never issue run_bash_command with destructive flags: rm -rf, dd, mkfs, "
+        "shred, wipefs, fdisk, parted, or any variant that could irreversibly destroy data. "
+        "If a task appears to require these, stop and ask the user for explicit confirmation.",
+        1
+    ),
+    (
+        "BASH_NO_PRIVILEGE_ESCALATION",
+        "Never use sudo, su, pkexec, or any privilege escalation mechanism inside "
+        "run_bash_command. All shell commands must execute as the current user only.",
+        1
+    ),
+    (
+        "SELF_NO_SCHEMA_MUTATION",
+        "Never alter database table schemas, drop tables, or run any DDL statement "
+        "(CREATE, DROP, ALTER) via run_bash_command or upsert_function. "
+        "Schema changes are a human operator responsibility only.",
+        1
+    ),
+    (
+        "SCHED_MAX_STAGGER_DELAY",
+        "Never issue a /stagger directive with a delay greater than 60 minutes. "
+        "For tasks requiring longer deferral, report this constraint and ask the user "
+        "to schedule externally via cron or the watchdog supervisor.",
+        1
+    ),
+    (
+        "PROMPT_NO_HARNESS_REMOVAL",
+        "Never modify, disable, or delete harness rules via any function call. "
+        "Harnesses are operator-level constraints and are not subject to agent self-modification.",
         1
     ),
 ]
@@ -514,6 +623,27 @@ def _seed_project_files(cursor):
     print(f"  [proj_files] Seeded {inserted}/{len(SEED_PROJECT_FILES)} project file(s).")
 
 
+def _seed_harnesses(cursor):
+    """
+    Insert harness rows if harness_name does not already exist.
+    Idempotent — safe to run on every boot.
+    Only enabled rows (harness_enabled=1) are injected into the system prompt
+    at runtime by db.assemble_system_prompt().
+    """
+    inserted = 0
+    for name, rule, enabled in SEED_HARNESSES:
+        cursor.execute(
+            "SELECT id FROM harnesses WHERE harness_name = ?", (name,)
+        )
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO harnesses (harness_name, harness_rule, harness_enabled) VALUES (?, ?, ?)",
+                (name, rule, enabled)
+            )
+            inserted += 1
+    print(f"  [harnesses] Seeded {inserted}/{len(SEED_HARNESSES)} harness rule(s).")
+
+
 # -----------------------------------------------------------------------------
 # PUBLIC ENTRY POINT
 # -----------------------------------------------------------------------------
@@ -537,6 +667,7 @@ def run(db_path=DB_PATH):
         _seed_functions(cursor)
         _seed_bash_logs(cursor)
         _seed_project_files(cursor)
+        _seed_harnesses(cursor)
 
         conn.commit()
         conn.close()
