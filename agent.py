@@ -8,16 +8,22 @@
 #   - Scratchpad dispatch loop (_agent_turn and helpers)
 #   - Terminal command dispatcher (_dispatch_command, COMMANDS)
 #   - Prompt reload trip-wire (_check_prompt_reload)
-#   - Execution loops (_loop_interactive, _loop_stateless)
+#   - Execution loops (loop_interactive, loop_stateless)
+#
+# RUNTIME CONTEXT HEADER
+#   _build_prompt() injects a live one-liner at call time containing the
+#   current weekday, date, time, and logged-in user. This keeps the stored
+#   DEFAULT prompt body timeless while the model always sees fresh temporal
+#   context — no static timestamp rot, no stale "today is Monday" lies.
 #
 # Model: Gemma 3/4 instruction-tuned (google_gemma-3-4b-it-q4_k_s.gguf)
 # Format: Gemma turn template — <start_of_turn> / <end_of_turn>
 # Thinking: THINKING_MODE=1 prepends <|think|> to the system block.
 #           Gemma reasons inside <|channel>thought...<channel|> blocks;
 #           _agent_turn extracts, prints, and strips them each cycle.
-# Anti-prompts: ANTI_PROMPTS_GEMMA  (e.g. <end_of_turn>, <eos>)
 # =============================================================================
 
+import datetime
 import os
 import re
 import sys
@@ -32,6 +38,29 @@ import db
 DB_PATH = None
 
 # -----------------------------------------------------------------------------
+# RUNTIME CONTEXT
+# Called fresh on every Kobold round-trip so temporal data never goes stale.
+# -----------------------------------------------------------------------------
+
+def _runtime_context_header():
+    """
+    Build a one-line context block injected at the top of every prompt.
+    Values are computed at call time — never cached, never stored in the DB.
+
+    Returns a formatted string such as:
+      [Context: Sunday 2026-04-19 | 14:32:07 | user: kim]
+
+    Logged-in user is pulled from the USER or LOGNAME environment variable.
+    Falls back to 'unknown' if neither is set (daemon/cron environments).
+    """
+    now      = datetime.datetime.now()
+    weekday  = now.strftime("%A")
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    user     = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    return f"[Context: {weekday} {date_str} | {time_str} | user: {user}]"
+
+# -----------------------------------------------------------------------------
 # KOBOLD INTERFACE
 # -----------------------------------------------------------------------------
 
@@ -39,16 +68,26 @@ def _build_prompt(system_prompt, conversation, thinking_mode):
     """
     Wrap system_prompt + conversation into Gemma's wire format for Kobold.
 
-    system_prompt  — fully assembled system prompt string
+    system_prompt  — fully assembled system prompt string (stored, timeless)
     conversation   — accumulated user + RESULT context for this turn
     thinking_mode  — bool; True = prepend <|think|> to the system block
 
-    Returns the raw prompt string ready to POST to Kobold.
+    The runtime context header is injected TWICE:
+      1. At the top of the system block — establishes authoritative context.
+      2. Immediately above the conversation — adjacent to the user's question
+         so the model cannot confabulate a stale time/date when answering
+         temporal queries directly from the header.
+
+    Both injections are computed from the same _runtime_context_header() call
+    so they are identical and consistent within a single round-trip.
     """
-    sys_block = f"<|think|>\n{system_prompt}" if thinking_mode else system_prompt
+    context   = _runtime_context_header()
+    sys_text  = f"{context}\n{system_prompt}"
+    sys_block = f"<|think|>\n{sys_text}" if thinking_mode else sys_text
     return (
         f"<start_of_turn>user\n"
         f"{sys_block}\n\n"
+        f"{context}\n"
         f"{conversation}<end_of_turn>\n"
         f"<start_of_turn>model\n"
     )
@@ -62,15 +101,16 @@ def _call_kobold(system_prompt, user_input, values, settings):
     All generation parameters are resolved live from the values/settings arrays
     so the agent can mutate them at runtime and have changes take effect on the
     very next call without a process restart.
+
+    Anti-prompts are sourced from the active model_profiles row (resolved in
+    index.py and stored in the profiles array). The legacy ANTI_PROMPTS_GEMMA
+    key in settings_values is no longer consulted.
     """
     endpoint      = db.resolve_value(values, "ENDPOINT_KOBOLD",    "http://localhost:5001/api/v1/generate")
     max_tokens    = int(db.resolve_value(values,   "KOBOLD_MAX_TOKENS",  "512"))
     temperature   = float(db.resolve_value(values, "KOBOLD_TEMPERATURE", "0.1"))
     top_p         = float(db.resolve_value(values, "KOBOLD_TOP_P",       "0.9"))
     thinking_mode = db.resolve_setting(settings, "THINKING_MODE", fallback=1) == 1
-
-    anti_raw     = db.resolve_value(values, "ANTI_PROMPTS_GEMMA", "<end_of_turn>,<eos>,\n\n\n")
-    anti_prompts = [t for t in anti_raw.split(",") if t]
 
     prompt  = _build_prompt(system_prompt, user_input, thinking_mode)
     payload = json.dumps({
@@ -99,9 +139,6 @@ def _call_kobold(system_prompt, user_input, values, settings):
         # mid-response drop from Kobold (OOM crash, VRAM exhaustion, etc.).
         return f"[ERROR] Kobold connection lost — {type(e).__name__}: {e}"
 
-    for token in anti_prompts:
-        text = text.split(token)[0]
-
     return text.strip()
 
 # -----------------------------------------------------------------------------
@@ -112,7 +149,7 @@ def _execute_function(functions, function_name, **kwargs):
     """
     Locate function_name in the loaded functions roster and exec() it.
     Keyword arguments are injected into the local scope before execution,
-    allowing parameterised functions (calculate, set_setting, set_value, etc.)
+    allowing parameterised functions (calculate, set_boolean, set_value, etc.)
     to receive their arguments cleanly.
     Returns the string value of `result` after execution, or an error string.
     """
@@ -220,7 +257,7 @@ def _parse_call_params(call_line):
       "get_current_datetime"                                      -> {}
       "calculate expr=6 * 7"                                     -> {"expr": "6 * 7"}
       "calculate expr=datetime.date(2026,4,6)+timedelta(days=3)" -> {"expr": "..."}
-      "set_setting setting_name=X setting_value=1"               -> {"setting_name": "X", "setting_value": 1}
+      "set_boolean setting_name=X setting_value=1"               -> {"setting_name": "X", "setting_value": 1}
       "set_value setting_name=FOO setting_value=bar"             -> {"setting_name": "FOO", "setting_value": "bar"}
     """
     tokens = call_line.strip().split(None, 1)
@@ -288,9 +325,18 @@ def _agent_turn(system_prompt, user_input, functions, values, settings):
       5. No directive — return raw verbatim.
 
     CALL: always beats FINAL: when both appear in the same response.
+
+    DUPLICATE CALL GUARD
+    If the model fires the exact same CALL with the exact same RESULT two
+    turns in a row it has stalled — the scratchpad is spinning in place.
+    Treat the last result as the final answer and break immediately.
+    This prevents runaway loops when the model lacks a FINAL: discipline.
     """
     thinking_mode = db.resolve_setting(settings, "THINKING_MODE", fallback=1) == 1
     conversation  = user_input
+
+    _last_call   = None   # (fn_name, fn_result) from the previous turn
+    _stall_count = 0      # consecutive identical CALL/RESULT pairs seen
 
     for _turn in range(MAX_SCRATCHPAD_TURNS):
         raw = _call_kobold(system_prompt, conversation, values, settings)
@@ -334,6 +380,19 @@ def _agent_turn(system_prompt, user_input, functions, values, settings):
             print(f"  → {call_target}")
             fn_result = _execute_function(functions, fn_name, **call_kwargs)
             print(f"  ← {fn_result}")
+
+            # Duplicate CALL guard — if identical (call, result) fires again,
+            # the model is stuck. Surface the result and break the chain.
+            this_call = (call_target, fn_result)
+            if this_call == _last_call:
+                _stall_count += 1
+                if _stall_count >= 2:
+                    print(f"  [agent] Loop stall detected on '{fn_name}' — surfacing result.")
+                    return fn_result
+            else:
+                _stall_count = 0
+            _last_call = this_call
+
             conversation = f"{conversation}\n{raw}\nRESULT: {fn_result}"
             continue
 
@@ -390,9 +449,11 @@ def _dispatch_command(raw_input, runtime, build_runtime_fn):
             print()
 
     elif token == "!prompt":
-        active = db.resolve_value(values, "DEFAULT_PROMPT", fallback="DEFAULT")
-        model  = db.resolve_value(values, "ACTIVE_MODEL",   fallback="GEMMA")
+        active  = db.resolve_value(values, "DEFAULT_PROMPT", fallback="DEFAULT")
+        model   = db.resolve_value(values, "ACTIVE_MODEL",   fallback="GEMMA")
+        context = _runtime_context_header()
         print(f"\n--- Active Prompt: {active}  |  Model: {model} ---")
+        print(f"{context}")
         print(f"{system_prompt}\n--- End ---\n")
 
     elif token == "!settings":
