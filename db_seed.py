@@ -289,6 +289,7 @@ SEED_MODEL_PROFILES = [
 # Add new source files here as the project grows.
 SEED_PROJECT_FILES = [
     ("/home/kim/projects/template/index.py",        "project1"),
+    ("/home/kim/projects/template/agent.py",        "project1"),
     ("/home/kim/projects/template/db.py",           "project1"),
     ("/home/kim/projects/template/db_seed.py",      "project1"),
     ("/home/kim/projects/template/db_functions.py", "project1"),
