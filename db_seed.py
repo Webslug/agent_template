@@ -126,6 +126,28 @@ SCHEMA = [
         """
     ),
     (
+        "function_audit_log",
+        """
+        CREATE TABLE IF NOT EXISTS function_audit_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            function_name TEXT     NOT NULL,
+            change_note   TEXT     NOT NULL DEFAULT '',
+            changed_at    DATETIME NOT NULL
+        )
+        """
+        # function_name — the function_name key from the functions table
+        # change_note   — free-text description of what changed and why;
+        #                 written by the agent via audit_function_change
+        # changed_at    — UTC timestamp of the modification
+        #
+        # PURPOSE: Every autonomous self-modification via upsert_function
+        # should be followed by a call to audit_function_change. This table
+        # is the paper trail — if the agent goes rogue or breaks itself, you
+        # can read function_audit_log to reconstruct exactly what it did,
+        # when, and what justification it gave. Never truncate this table
+        # without archiving it first.
+    ),
+    (
         "model_profiles",
         """
         CREATE TABLE IF NOT EXISTS model_profiles (
@@ -325,8 +347,8 @@ SEED_PROMPTS = [
             "  CALL: function_name\n\n"
             "Some functions accept parameters on the same line:\n"
             "  CALL: calculate expr=<python_expression>\n"
-            "  CALL: set_boolean setting_name=<name> setting_value=<0_or_1>\n"
-            "  CALL: set_value setting_name=<name> setting_value=<value>\n"
+            "  CALL: set_boolean setting_name=<n> setting_value=<0_or_1>\n"
+            "  CALL: set_value setting_name=<n> setting_value=<value>\n"
             "  CALL: run_bash_command expr=<shell_command>\n"
             "  CALL: upsert_function setting_name=<fn_name> setting_value=<python_body>\n"
             "  CALL: add_prompt setting_name=<prompt_name> setting_value=<prompt_body>\n\n"
@@ -336,7 +358,7 @@ SEED_PROMPTS = [
 
             "EXECUTION PROTOCOL:\n"
             "The system will execute the function and return the real output as:\n"
-            "  RESULT: <output>\n\n"
+            "  RESULT: <o>\n\n"
             "Chain as many CALL/RESULT cycles as the task requires.\n"
             "Never invent or simulate a RESULT. Always wait for the system to supply it.\n\n"
 
@@ -379,7 +401,10 @@ SEED_PROMPTS = [
             "  CALL: list_functions\n"
             "  Review gaps. If a useful capability is missing, design and build it.\n\n"
             "BUILD — extend yourself with new functions via upsert_function:\n"
+            "  Always call validate_function_body first. If it returns OK, proceed.\n"
             "  CALL: upsert_function setting_name=<fn_name> setting_value=<python_body>\n"
+            "  Then immediately record the change:\n"
+            "  CALL: audit_function_change setting_name=<fn_name> setting_value=<reason>\n"
             "  Bodies must assign output to the `result` variable. New functions activate after restart.\n\n"
             "HARDEN — if an existing function body is brittle or incomplete, rewrite and upsert it.\n\n"
             "REPORT — after any self-modification, emit a FINAL summary of what changed and why.\n\n"
@@ -475,6 +500,20 @@ SEED_HARNESSES = [
         "Never alter database table schemas, drop tables, or run any DDL statement "
         "(CREATE, DROP, ALTER) via run_bash_command or upsert_function. "
         "Schema changes are a human operator responsibility only.",
+        1
+    ),
+    (
+        "SELF_VALIDATE_BEFORE_UPSERT",
+        "Before every call to upsert_function, call validate_function_body with the "
+        "candidate body. If the result is not 'OK', abort the upsert and report the "
+        "prohibited pattern to the user. Never skip this check.",
+        1
+    ),
+    (
+        "SELF_AUDIT_AFTER_UPSERT",
+        "After every successful upsert_function call, immediately call audit_function_change "
+        "with the function name and a brief plain-English description of what was changed and why. "
+        "This entry is the permanent record of the modification. Never skip this step.",
         1
     ),
     (
@@ -608,6 +647,17 @@ def _seed_bash_logs(cursor):
     print(f"  [bash_logs] Table ready. {count} existing audit row(s).")
 
 
+def _seed_function_audit_log(cursor):
+    """
+    function_audit_log is an audit table — no seed rows required.
+    Rows are written exclusively by the agent via audit_function_change.
+    This call confirms the table is present and reports existing row count.
+    """
+    cursor.execute("SELECT COUNT(*) FROM function_audit_log")
+    count = cursor.fetchone()[0]
+    print(f"  [fn_audit]  Table ready. {count} existing audit row(s).")
+
+
 def _seed_project_files(cursor):
     """
     Insert project_files rows if the file_path does not already exist.
@@ -672,6 +722,7 @@ def run(db_path=DB_PATH):
         _seed_prompts(cursor)
         _seed_functions(cursor)
         _seed_bash_logs(cursor)
+        _seed_function_audit_log(cursor)
         _seed_project_files(cursor)
         _seed_harnesses(cursor)
 

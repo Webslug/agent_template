@@ -7,7 +7,7 @@
 # function_body is a string of Python executed via exec() at runtime.
 # All function bodies must assign their output to the variable `result`.
 #
-# FUNCTION ROSTER (13 total)
+# FUNCTION ROSTER (17 total)
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM INFORMATION
 #   get_system_info        — OS, Python version, hostname
@@ -25,6 +25,7 @@
 #
 # PROMPT MANAGEMENT (agent_prompts)
 #   list_prompts           — show prompt_name + enabled status
+#   get_prompt_body        — return the full body of a named prompt
 #   add_prompt             — insert a new named prompt body
 #   reload_prompt          — hot-swap active prompt at runtime
 #
@@ -32,6 +33,10 @@
 #   list_functions         — dump name + description of all enabled functions
 #   upsert_function        — insert or overwrite a function in the DB roster
 #   get_bash_log           — retrieve recent agent_bash_logs audit entries
+#
+# SAFETY / VALIDATION
+#   validate_function_body — pre-flight regex scan before upsert_function
+#   audit_function_change  — write a timestamped row to function_audit_log
 #
 # BASH EXECUTION
 #   run_bash_command       — sandboxed shell with full audit trail
@@ -201,6 +206,30 @@ SEED_FUNCTIONS = [
     ),
 
     (
+        "get_prompt_body",
+        (
+            "Returns the full prompt_body text of a named prompt from agent_prompts. "
+            "Requires one parameter: `setting_value` (str) — the prompt_name to look up. "
+            "Returns an error string if the prompt does not exist. "
+            "Example: get_prompt_body setting_value=DEFAULT"
+        ),
+        (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('database.db')\n"
+            "row = conn.execute(\n"
+            "    'SELECT prompt_body FROM agent_prompts WHERE prompt_name = ?',\n"
+            "    (setting_value,)\n"
+            ").fetchone()\n"
+            "conn.close()\n"
+            "if not row:\n"
+            "    result = f'[ERROR] Prompt \"{setting_value}\" not found.'\n"
+            "else:\n"
+            "    result = row[0]"
+        ),
+        "python"
+    ),
+
+    (
         "add_prompt",
         (
             "Inserts a new prompt into the agent_prompts table. "
@@ -309,6 +338,8 @@ SEED_FUNCTIONS = [
             "The description field is set to a placeholder — update it manually via run_bash_command "
             "or a follow-up SQL call if a precise description is needed. "
             "The updated roster takes effect on the next reseed or process restart. "
+            "IMPORTANT: always call validate_function_body before calling upsert_function "
+            "to ensure the body does not contain prohibited patterns. "
             "Example: upsert_function setting_name=my_tool setting_value=result=42"
         ),
         (
@@ -377,6 +408,74 @@ SEED_FUNCTIONS = [
             "            line += f' | stderr: {stderr[:120]}'\n"
             "        lines.append(line)\n"
             "    result = '\\n'.join(lines)"
+        ),
+        "python"
+    ),
+
+    # -------------------------------------------------------------------------
+    # SAFETY / VALIDATION
+    # validate_function_body is a pre-flight guard — call it before any
+    # upsert_function invocation to catch prohibited patterns before they
+    # reach exec(). audit_function_change writes a timestamped accountability
+    # row to function_audit_log whenever a function is inserted or updated.
+    # Together they form the two-step "check then record" contract that makes
+    # autonomous self-modification traceable and recoverable.
+    # -------------------------------------------------------------------------
+
+    (
+        "validate_function_body",
+        (
+            "Scans a candidate Python function body for prohibited patterns before insertion. "
+            "Requires one parameter: `setting_value` (str) — the full function body to inspect. "
+            "Returns 'OK' if the body is clean, or an error string naming the offending pattern. "
+            "Always call this before upsert_function when operating autonomously. "
+            "Prohibited: import os, import sys, import subprocess (outside approved wrappers), "
+            "and DDL keywords (DROP, ALTER, CREATE TABLE) inside execute() calls. "
+            "Example: validate_function_body setting_value=result=42"
+        ),
+        (
+            "import re\n"
+            "body = str(setting_value)\n"
+            "prohibited = [\n"
+            "    (r'import\\s+os\\b',                          'import os'),\n"
+            "    (r'import\\s+sys\\b',                         'import sys'),\n"
+            "    (r'__import__\\s*\\(',                        '__import__() call'),\n"
+            "    (r'\\.execute\\s*\\(.*?\\b(DROP|ALTER)\\b',   'DDL statement in execute()'),\n"
+            "    (r'CREATE\\s+TABLE',                          'CREATE TABLE in body'),\n"
+            "]\n"
+            "for pattern, label in prohibited:\n"
+            "    if re.search(pattern, body, re.IGNORECASE | re.DOTALL):\n"
+            "        result = f'[ERROR] Prohibited pattern detected: {label}'\n"
+            "        break\n"
+            "else:\n"
+            "    result = 'OK'"
+        ),
+        "python"
+    ),
+
+    (
+        "audit_function_change",
+        (
+            "Writes a timestamped audit row to the function_audit_log table recording "
+            "a function insertion or update. "
+            "Requires two parameters: `setting_name` (str) — the function_name being changed, "
+            "and `setting_value` (str) — a brief description of what changed and why. "
+            "Call this immediately after a successful upsert_function. "
+            "Example: audit_function_change setting_name=my_tool setting_value=inserted to handle CSV parsing"
+        ),
+        (
+            "import sqlite3\n"
+            "import datetime\n"
+            "now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')\n"
+            "conn = sqlite3.connect('database.db')\n"
+            "conn.execute(\n"
+            "    'INSERT INTO function_audit_log (function_name, change_note, changed_at) '\n"
+            "    'VALUES (?, ?, ?)',\n"
+            "    (str(setting_name), str(setting_value), now)\n"
+            ")\n"
+            "conn.commit()\n"
+            "conn.close()\n"
+            "result = f'Audit entry recorded for \"{setting_name}\" at {now}.'"
         ),
         "python"
     ),

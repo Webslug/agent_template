@@ -159,6 +159,13 @@ Kills any running koboldcpp before launch. Located at `/home/kim/Downloads/kobol
 5. **No Ollama routing** — `ENDPOINT_OLLAMA` is seeded but `_call_kobold` never dispatches
    to it. A routing decision based on `active_profile["endpoint_key"]` is needed.
 
+## RECENT FIXES
+
+1. **`/evolve local` output quality hardened** — the local Gemma path now uses a stricter,
+   shorter prompt and a deterministic fallback report when the model response is obviously
+   unusable. This was verified by rerunning `index.py` and then invoking `/evolve local`.
+   The fallback now keeps the tool useful even when Gemma drifts into gibberish.
+
 ---
 
 ## PLANNED ADDITIONS (not yet built)
