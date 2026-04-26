@@ -1,9 +1,0 @@
-# /evolve local — 2026-04-19 14:25:26
-# Model: Kobold (local)
-================================================================
-
-1. Missing function - The agent lacks a function to retrieve the current state of all settings (both boolean and value) in a single, consolidated view. - Implement a function that calls get_all_settings and get_all_values and returns a combined, human-readable summary.
-2. Missing settings - The project lacks a setting to control the maximum number of tokens for the agent's input context window. - Add a setting, e.g., INPUT_CONTEXT_WINDOW, to settings_values.
-3. Missing harness rules - The project lacks a harness rule to prevent the agent from making external network calls outside of the defined endpoints. - Implement a harness rule enforcing network isolation unless explicitly permitted by a specific setting.
-4. Brittle function behavior - The function descriptions are placeholders or missing for several tools, making it hard for the LLM to use them correctly. - Update the descriptions for all existing functions, especially those using upsert_function, to be clear and actionable.
-5. Architectural cleanup - The database interaction logic is split between db.py and db_functions.py. - Refactor the database access layer to centralize all CRUD operations into a single, cohesive module.
