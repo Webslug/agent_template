@@ -215,8 +215,9 @@ SCHEMA = [
 SEED_SETTINGS = [
     # (setting_name, setting_bool)
     ("INTERACTIVE_MODE", 1),   # 0 = stateless/daemon, 1 = interactive readline
-    ("TTS",    1),   		   # sent to a local or remote TTS service.
-    ("STT",    0),   		   # enable speech to text transcription
+    ("TTS",          1),   # 1 = speak Kobold responses via tts_daemon_turbo.py
+    ("TTS_DEBUG",    0),   # 1 = print TTS pipeline progress to console, 0 = silent
+    ("STT",          0),   # enable speech to text transcription
     ("DEBUG_LOGGING",    0),   # reserved for future verbose output toggle
     ("PROMPT_RELOAD",    0),   # trip wire — agent sets to 1 to trigger hot-swap;
                                # agent.py resets to 0 after reload is complete
