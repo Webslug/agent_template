@@ -238,6 +238,7 @@ SEED_VALUES = [
     ("TTS_PROVIDER",     ""),
     ("TTS_SPLIT_CHUNKS", "200"),
     ("TTS_VOICE_REF",    "/home/kim/projects/template/voice/keira.wav"),    # Absolute path to the voice reference WAV for Chatterbox.
+    ("TTS_CHARACTER_STRIP",     "*#_~`[]"),
     ("KOBOLD_MAX_TOKENS",  "512"),
     ("KOBOLD_TEMPERATURE", "0.1"),
     ("KOBOLD_TOP_P",       "0.9"),
