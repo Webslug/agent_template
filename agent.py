@@ -46,6 +46,7 @@ import urllib.error
 
 import db
 import evolve
+import tts
 
 # Injected by index.py after import so agent functions can reach the DB.
 DB_PATH   = None
@@ -752,6 +753,9 @@ def loop_interactive(runtime, build_runtime_fn):
             _dispatch_stagger(response.strip(), runtime, build_runtime_fn)
         else:
             print(f"{response}\n")
+            # TTS gate — speak the response if INTERACTIVE_MODE=1 and TTS=1.
+            # The cooldown and all other guards live inside tts.speak() itself.
+            tts.speak(response, settings, values)
 
 
 def loop_stateless(runtime, build_runtime_fn):

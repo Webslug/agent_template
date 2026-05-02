@@ -215,6 +215,8 @@ SCHEMA = [
 SEED_SETTINGS = [
     # (setting_name, setting_bool)
     ("INTERACTIVE_MODE", 1),   # 0 = stateless/daemon, 1 = interactive readline
+    ("TTS",    1),   		   # sent to a local or remote TTS service.
+    ("STT",    0),   		   # enable speech to text transcription
     ("DEBUG_LOGGING",    0),   # reserved for future verbose output toggle
     ("PROMPT_RELOAD",    0),   # trip wire — agent sets to 1 to trigger hot-swap;
                                # agent.py resets to 0 after reload is complete
@@ -232,6 +234,9 @@ SEED_VALUES = [
     ("DEFAULT_PROMPT",     "DEFAULT"),
     ("ENDPOINT_KOBOLD",    "http://localhost:5001/api/v1/generate"),
     ("ENDPOINT_OLLAMA",    "http://localhost:11434/api/generate"),
+    ("TTS_PROVIDER",     ""),
+    ("TTS_SPLIT_CHUNKS", "200"),
+    ("TTS_VOICE_REF",    "/home/kim/projects/template/voice/keira.wav"),    # Absolute path to the voice reference WAV for Chatterbox.
     ("KOBOLD_MAX_TOKENS",  "512"),
     ("KOBOLD_TEMPERATURE", "0.1"),
     ("KOBOLD_TOP_P",       "0.9"),

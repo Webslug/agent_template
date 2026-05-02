@@ -7,7 +7,7 @@
 # function_body is a string of Python executed via exec() at runtime.
 # All function bodies must assign their output to the variable `result`.
 #
-# FUNCTION ROSTER (17 total)
+# FUNCTION ROSTER (18 total)
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM INFORMATION
 #   get_system_info        — OS, Python version, hostname
@@ -43,6 +43,10 @@
 #
 # MODEL SWITCHING
 #   switch_model           — atomically swap model profile + prompt + thinking mode
+#
+# TTS
+#   tts_speak              — speak a text passage via tts_daemon_turbo.py;
+#                            chunks, stitches, and plays — agent-callable
 # =============================================================================
 
 SEED_FUNCTIONS = [
@@ -232,12 +236,11 @@ SEED_FUNCTIONS = [
     (
         "add_prompt",
         (
-            "Inserts a new prompt into the agent_prompts table. "
-            "Requires two parameters: `setting_name` (str) — the prompt_name key, "
+            "Inserts a new named prompt body into the agent_prompts table. "
+            "Requires two parameters: `setting_name` (str) — the prompt_name, "
             "and `setting_value` (str) — the full prompt body text. "
-            "The prompt is inserted as enabled. Skips insertion if prompt_name already exists. "
-            "After adding, call reload_prompt with the new name to activate it. "
-            "Example: add_prompt setting_name=TERSE_MODE setting_value=You are a terse agent."
+            "Does not overwrite an existing prompt with the same name — use upsert_function for that. "
+            "Example: add_prompt setting_name=ASSISTANT setting_value=You are a helpful assistant."
         ),
         (
             "import sqlite3\n"
@@ -246,16 +249,15 @@ SEED_FUNCTIONS = [
             "    'SELECT id FROM agent_prompts WHERE prompt_name = ?', (setting_name,)\n"
             ").fetchone()\n"
             "if existing:\n"
-            "    conn.close()\n"
-            "    result = f'[SKIP] Prompt \"{setting_name}\" already exists. Use reload_prompt to activate it.'\n"
+            "    result = f'[ERROR] Prompt \"{setting_name}\" already exists. Delete it first or use a different name.'\n"
             "else:\n"
             "    conn.execute(\n"
             "        'INSERT INTO agent_prompts (prompt_name, prompt_body, prompt_enabled) VALUES (?, ?, 1)',\n"
             "        (setting_name, str(setting_value))\n"
             "    )\n"
             "    conn.commit()\n"
-            "    conn.close()\n"
-            "    result = f'Prompt \"{setting_name}\" added successfully.'"
+            "    result = f'Prompt \"{setting_name}\" inserted successfully.'\n"
+            "conn.close()"
         ),
         "python"
     ),
@@ -263,27 +265,27 @@ SEED_FUNCTIONS = [
     (
         "reload_prompt",
         (
-            "Switches the active system prompt by updating DEFAULT_PROMPT in settings_values "
-            "to the given prompt_name, then sets PROMPT_RELOAD=1 in settings_boolean to signal "
-            "index.py to hot-swap the prompt on the next turn. "
-            "Requires one parameter: `setting_value` (str) — the target prompt_name. "
-            "The new prompt must already exist and be enabled in the agent_prompts table."
+            "Hot-swaps the active system prompt by updating DEFAULT_PROMPT in settings_values "
+            "and setting the PROMPT_RELOAD trip-wire to 1. "
+            "Requires one parameter: `setting_value` (str) — the prompt_name to activate. "
+            "The agent loop detects PROMPT_RELOAD=1 at the next turn and rebuilds the runtime state. "
+            "Example: reload_prompt setting_value=ASSISTANT"
         ),
         (
             "import sqlite3\n"
             "conn = sqlite3.connect('database.db')\n"
-            "row = conn.execute(\n"
+            "existing = conn.execute(\n"
             "    'SELECT id FROM agent_prompts WHERE prompt_name = ? AND prompt_enabled = 1',\n"
             "    (setting_value,)\n"
             ").fetchone()\n"
-            "if not row:\n"
+            "if not existing:\n"
+            "    result = f'[ERROR] Prompt \"{setting_value}\" not found or disabled.'\n"
             "    conn.close()\n"
-            "    result = f'[ERROR] Prompt \"{setting_value}\" not found or is disabled.'\n"
             "else:\n"
             "    conn.execute(\n"
             "        'INSERT INTO settings_values (setting_name, setting_value) VALUES (?, ?) '\n"
             "        'ON CONFLICT(setting_name) DO UPDATE SET setting_value = ?',\n"
-            "        ('DEFAULT_PROMPT', setting_value, setting_value)\n"
+            "        ('DEFAULT_PROMPT', str(setting_value), str(setting_value))\n"
             "    )\n"
             "    conn.execute(\n"
             "        'INSERT INTO settings_boolean (setting_name, setting_bool) VALUES (?, ?) '\n"
@@ -292,26 +294,21 @@ SEED_FUNCTIONS = [
             "    )\n"
             "    conn.commit()\n"
             "    conn.close()\n"
-            "    result = f'Active prompt switched to \"{setting_value}\". Reload flagged.'"
+            "    result = f'DEFAULT_PROMPT set to \"{setting_value}\". PROMPT_RELOAD armed — hot-swap on next turn.'"
         ),
         "python"
     ),
 
     # -------------------------------------------------------------------------
     # SELF-MODIFICATION
-    # Functions that allow the agent to inspect and rewrite its own roster.
-    # upsert_function is the highest-leverage self-modification tool: an agent
-    # that can rewrite its own functions is genuinely self-improving.
-    # get_bash_log gives the agent auditability of its own shell history.
+    # Allows the agent to inspect and extend its own function roster.
+    # upsert_function writes directly to the functions table.
+    # Always call validate_function_body then audit_function_change around it.
     # -------------------------------------------------------------------------
 
     (
         "list_functions",
-        (
-            "Returns the name and description of all enabled functions in the roster. "
-            "Useful mid-chain to verify what tools are available without leaving the scratchpad loop. "
-            "No parameters required."
-        ),
+        "Returns the name and description of every enabled function in the functions table.",
         (
             "import sqlite3\n"
             "conn = sqlite3.connect('database.db')\n"
@@ -319,10 +316,7 @@ SEED_FUNCTIONS = [
             "    'SELECT function_name, function_description FROM functions WHERE function_enabled = 1'\n"
             ").fetchall()\n"
             "conn.close()\n"
-            "if not rows:\n"
-            "    result = '(no enabled functions found)'\n"
-            "else:\n"
-            "    result = '\\n'.join(f'{name}: {desc}' for name, desc in rows)"
+            "result = '\\n'.join(f'{name}: {desc}' for name, desc in rows) or '(no functions found)'"
         ),
         "python"
     ),
@@ -330,50 +324,39 @@ SEED_FUNCTIONS = [
     (
         "upsert_function",
         (
-            "Inserts or overwrites a function entry in the functions table. "
+            "Inserts or replaces a function in the functions table. "
             "Requires two parameters: `setting_name` (str) — the function_name, "
-            "and `setting_value` (str) — the full Python function body. "
-            "The body must assign its output to the `result` variable. "
-            "If the function_name already exists, its body and modified timestamp are updated. "
-            "The description field is set to a placeholder — update it manually via run_bash_command "
-            "or a follow-up SQL call if a precise description is needed. "
-            "The updated roster takes effect on the next reseed or process restart. "
-            "IMPORTANT: always call validate_function_body before calling upsert_function "
-            "to ensure the body does not contain prohibited patterns. "
-            "Example: upsert_function setting_name=my_tool setting_value=result=42"
+            "and `setting_value` (str) — the complete Python function body. "
+            "The body must assign its output to the variable `result`. "
+            "Always call validate_function_body first, then audit_function_change after. "
+            "Example: upsert_function setting_name=my_tool setting_value=result = 'hello'"
         ),
         (
             "import sqlite3\n"
             "import datetime\n"
-            "fname = str(setting_name).strip()\n"
-            "fbody = str(setting_value)\n"
-            "if not fname:\n"
-            "    result = '[ERROR] setting_name (function_name) must not be empty.'\n"
+            "now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')\n"
+            "conn = sqlite3.connect('database.db')\n"
+            "existing = conn.execute(\n"
+            "    'SELECT id FROM functions WHERE function_name = ?', (setting_name,)\n"
+            ").fetchone()\n"
+            "if existing:\n"
+            "    conn.execute(\n"
+            "        'UPDATE functions SET function_body = ?, function_modified = ?, function_enabled = 1 '\n"
+            "        'WHERE function_name = ?',\n"
+            "        (str(setting_value), now, setting_name)\n"
+            "    )\n"
+            "    action = 'updated'\n"
             "else:\n"
-            "    now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')\n"
-            "    conn = sqlite3.connect('database.db')\n"
-            "    existing = conn.execute(\n"
-            "        'SELECT id FROM functions WHERE function_name = ?', (fname,)\n"
-            "    ).fetchone()\n"
-            "    if existing:\n"
-            "        conn.execute(\n"
-            "            'UPDATE functions SET function_body = ?, function_modified = ? '\n"
-            "            'WHERE function_name = ?',\n"
-            "            (fbody, now, fname)\n"
-            "        )\n"
-            "        action = 'updated'\n"
-            "    else:\n"
-            "        conn.execute(\n"
-            "            'INSERT INTO functions '\n"
-            "            '(function_name, function_description, function_body, '\n"
-            "            ' function_language, function_created, function_modified, function_enabled) '\n"
-            "            'VALUES (?, ?, ?, ?, ?, ?, 1)',\n"
-            "            (fname, f'Auto-generated: {fname}', fbody, 'python', now, now)\n"
-            "        )\n"
-            "        action = 'inserted'\n"
-            "    conn.commit()\n"
-            "    conn.close()\n"
-            "    result = f'Function \"{fname}\" {action} successfully. Restart or reseed to activate.'"
+            "    conn.execute(\n"
+            "        'INSERT INTO functions (function_name, function_description, function_body, '\n"
+            "        'function_language, function_created, function_modified, function_enabled) '\n"
+            "        'VALUES (?, ?, ?, ?, ?, ?, 1)',\n"
+            "        (setting_name, '(agent-inserted)', str(setting_value), 'python', now, now)\n"
+            "    )\n"
+            "    action = 'inserted'\n"
+            "conn.commit()\n"
+            "conn.close()\n"
+            "result = f'Function \"{setting_name}\" {action} successfully.'"
         ),
         "python"
     ),
@@ -381,67 +364,60 @@ SEED_FUNCTIONS = [
     (
         "get_bash_log",
         (
-            "Returns the most recent entries from the agent_bash_logs audit table. "
-            "Requires one parameter: `setting_value` (int as str) — the number of rows to return (max 50). "
-            "Defaults to 3 rows if no value is supplied. "
-            "Each row shows: run_at, exit_code, command, and any stderr output. "
-            "Example: get_bash_log setting_value=10"
+            "Retrieves the most recent entries from the agent_bash_logs audit table. "
+            "Requires one parameter: `expr` (str) — the number of rows to return (e.g. '10'). "
+            "Returns command, exit_code, and run_at for each row. "
+            "Example: get_bash_log expr=10"
         ),
         (
             "import sqlite3\n"
-            "raw_val = str(setting_value).strip()\n"
-            "limit = min(int(raw_val) if raw_val else 3, 50)\n"
+            "try:\n"
+            "    limit = int(str(expr).strip())\n"
+            "except ValueError:\n"
+            "    limit = 10\n"
             "conn = sqlite3.connect('database.db')\n"
             "rows = conn.execute(\n"
-            "    'SELECT run_at, exit_code, command, stderr FROM agent_bash_logs '\n"
-            "    'ORDER BY id DESC LIMIT ?',\n"
-            "    (limit,)\n"
+            "    'SELECT command, exit_code, run_at FROM agent_bash_logs '\n"
+            "    'ORDER BY id DESC LIMIT ?', (limit,)\n"
             ").fetchall()\n"
             "conn.close()\n"
             "if not rows:\n"
             "    result = '(no bash log entries found)'\n"
             "else:\n"
-            "    lines = []\n"
-            "    for run_at, exit_code, command, stderr in rows:\n"
-            "        line = f'[{run_at}] exit={exit_code} | {command}'\n"
-            "        if stderr:\n"
-            "            line += f' | stderr: {stderr[:120]}'\n"
-            "        lines.append(line)\n"
-            "    result = '\\n'.join(lines)"
+            "    result = '\\n'.join(\n"
+            "        f'[{run_at}] exit={code} | {cmd[:120]}'\n"
+            "        for cmd, code, run_at in rows\n"
+            "    )"
         ),
         "python"
     ),
 
     # -------------------------------------------------------------------------
     # SAFETY / VALIDATION
-    # validate_function_body is a pre-flight guard — call it before any
-    # upsert_function invocation to catch prohibited patterns before they
-    # reach exec(). audit_function_change writes a timestamped accountability
-    # row to function_audit_log whenever a function is inserted or updated.
-    # Together they form the two-step "check then record" contract that makes
-    # autonomous self-modification traceable and recoverable.
+    # Pre-flight checks before autonomous self-modification.
+    # validate_function_body scans for dangerous imports and DDL.
+    # audit_function_change writes the paper trail after a successful upsert.
     # -------------------------------------------------------------------------
 
     (
         "validate_function_body",
         (
-            "Scans a candidate Python function body for prohibited patterns before insertion. "
-            "Requires one parameter: `setting_value` (str) — the full function body to inspect. "
-            "Returns 'OK' if the body is clean, or an error string naming the offending pattern. "
-            "Always call this before upsert_function when operating autonomously. "
-            "Prohibited: import os, import sys, import subprocess (outside approved wrappers), "
-            "and DDL keywords (DROP, ALTER, CREATE TABLE) inside execute() calls. "
-            "Example: validate_function_body setting_value=result=42"
+            "Scans a proposed function body string for prohibited patterns before upsert. "
+            "Requires one parameter: `setting_value` (str) — the function body to validate. "
+            "Returns 'OK' if safe, or an error string describing the violation. "
+            "Always call this before upsert_function. "
+            "Example: validate_function_body setting_value=result = 'hello'"
         ),
         (
             "import re\n"
             "body = str(setting_value)\n"
             "prohibited = [\n"
-            "    (r'import\\s+os\\b',                          'import os'),\n"
-            "    (r'import\\s+sys\\b',                         'import sys'),\n"
-            "    (r'__import__\\s*\\(',                        '__import__() call'),\n"
-            "    (r'\\.execute\\s*\\(.*?\\b(DROP|ALTER)\\b',   'DDL statement in execute()'),\n"
-            "    (r'CREATE\\s+TABLE',                          'CREATE TABLE in body'),\n"
+            "    (r'import\\s+os\\b',                             'import os'),\n"
+            "    (r'import\\s+subprocess\\b',                     'import subprocess'),\n"
+            "    (r'import\\s+sys\\b',                            'import sys'),\n"
+            "    (r'__import__\\s*\\(',                           '__import__() call'),\n"
+            "    (r'\\.execute\\s*\\(.*?\\b(DROP|ALTER)\\b',      'DDL statement in execute()'),\n"
+            "    (r'CREATE\\s+TABLE',                             'CREATE TABLE in body'),\n"
             "]\n"
             "for pattern, label in prohibited:\n"
             "    if re.search(pattern, body, re.IGNORECASE | re.DOTALL):\n"
@@ -607,6 +583,53 @@ SEED_FUNCTIONS = [
             "        f'Thinking: {profile[\"THINKING_MODE\"]}. '\n"
             "        f'Reload flagged. Restart Kobold with the {label} model file.'\n"
             "    )\n"
+        ),
+        "python"
+    ),
+
+    # -------------------------------------------------------------------------
+    # TTS
+    # Agent-callable wrapper around tts.speak().
+    # The agent can explicitly request speech synthesis via CALL: tts_speak.
+    # All gate logic (INTERACTIVE_MODE, TTS flag, cooldown, socket check,
+    # TTS_VOICE_REF validation) lives in tts.py — this body is intentionally
+    # thin. The exec() context has no access to the runtime arrays, so we
+    # re-read both tables from SQLite here solely for the tts.speak() call.
+    # This is the one legitimate exception to the no-query-at-runtime rule:
+    # the agent function sandbox has no other path to the loaded arrays.
+    # -------------------------------------------------------------------------
+
+    (
+        "tts_speak",
+        (
+            "Speaks a text passage aloud via the local TTS daemon (tts_daemon_turbo.py). "
+            "Only fires in interactive mode when TTS is enabled in settings_boolean. "
+            "Long passages are automatically split into chunks and stitched into one WAV before playback. "
+            "Requires one parameter: `expr` (str) — the text to speak. "
+            "Example: tts_speak expr=The operation completed successfully."
+        ),
+        (
+            "import sqlite3\n"
+            "import sys\n"
+            "import tts\n"
+            "\n"
+            "text = str(expr).strip()\n"
+            "if not text:\n"
+            "    result = '[TTS] No text supplied.'\n"
+            "else:\n"
+            "    # Re-read the runtime arrays from SQLite — exec() sandbox has no\n"
+            "    # access to the outer runtime tuple, so this is unavoidable here.\n"
+            "    try:\n"
+            "        conn = sqlite3.connect('database.db')\n"
+            "        conn.row_factory = sqlite3.Row\n"
+            "        settings = [dict(r) for r in conn.execute('SELECT * FROM settings_boolean').fetchall()]\n"
+            "        values   = [dict(r) for r in conn.execute('SELECT * FROM settings_values').fetchall()]\n"
+            "        conn.close()\n"
+            "    except Exception as e:\n"
+            "        result = f'[TTS] Could not load settings: {e}'\n"
+            "    else:\n"
+            "        tts.speak(text, settings, values)\n"
+            "        result = f'[TTS] Dispatched: \"{text[:80]}{'...' if len(text) > 80 else ''}\"'"
         ),
         "python"
     ),
