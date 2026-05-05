@@ -27,11 +27,22 @@
 #   and routes them identically to operator-issued stagger commands.
 #   Active timers are tracked in _STAGGER_REGISTRY for !stagger inspection.
 #
-# Model: Gemma 3/4 instruction-tuned (google_gemma-3-4b-it-q4_k_s.gguf)
-# Format: Gemma turn template — <start_of_turn> / <end_of_turn>
-# Thinking: THINKING_MODE=1 prepends <|think|> to the system block.
-#           Gemma reasons inside <|channel>thought...<channel|> blocks;
-#           _agent_turn extracts, prints, and strips them each cycle.
+# PROMPT FORMAT DISPATCH
+#   _build_prompt() is format-aware. It reads prompt_format from the active
+#   model_profiles row and wraps the prompt in the correct turn template:
+#     "gemma"   → <start_of_turn>user / <end_of_turn> / <start_of_turn>model
+#     "chatml"  → <|im_start|>user / <|im_end|> / <|im_start|>assistant
+#     "llama3"  → <|start_header_id|>user<|end_header_id|> / <|eot_id|>
+#     "mistral" → [INST] ... [/INST]
+#     "phi3"    → <|user|> ... <|end|> / <|assistant|>
+#   Thinking token injection is also format-aware:
+#     "gemma"  → <|think|> prepended to system block
+#     "chatml" → <think> prepended to system block (Qwen3 native)
+#
+# THOUGHT BLOCK PARSING
+#   _extract_thought() and the strip logic in _agent_turn handle both formats:
+#     Gemma:  <|channel>thought ... <channel|>
+#     ChatML: <think> ... </think>
 # =============================================================================
 
 import datetime
@@ -97,13 +108,15 @@ def _runtime_context_header():
 # KOBOLD INTERFACE
 # -----------------------------------------------------------------------------
 
-def _build_prompt(system_prompt, conversation, thinking_mode):
+def _build_prompt(system_prompt, conversation, thinking_mode, prompt_format="gemma"):
     """
-    Wrap system_prompt + conversation into Gemma's wire format for Kobold.
+    Wrap system_prompt + conversation into the correct wire format for Kobold,
+    keyed on prompt_format from the active model_profiles row.
 
     system_prompt  — fully assembled system prompt string (stored, timeless)
     conversation   — accumulated user + RESULT context for this turn
-    thinking_mode  — bool; True = prepend <|think|> to the system block
+    thinking_mode  — bool; True = prepend the model's thinking token
+    prompt_format  — one of: gemma | chatml | llama3 | mistral | phi3
 
     The runtime context header is injected TWICE:
       1. At the top of the system block — establishes authoritative context.
@@ -111,22 +124,75 @@ def _build_prompt(system_prompt, conversation, thinking_mode):
          so the model cannot confabulate a stale time/date when answering
          temporal queries directly from the header.
 
-    Both injections are computed from the same _runtime_context_header() call
-    so they are identical and consistent within a single round-trip.
+    THINKING TOKEN INJECTION (when thinking_mode=True):
+      gemma  → <|think|> prepended to system block
+      chatml → <think>   prepended to system block (Qwen3 native token)
+      others → no thinking token (architectures without native thinking)
+
+    FORMAT MAP:
+      gemma   → <start_of_turn>user ... <end_of_turn><start_of_turn>model
+      chatml  → <|im_start|>user ... <|im_end|><|im_start|>assistant
+      llama3  → <|start_header_id|>user<|end_header_id|> ... <|eot_id|>
+      mistral → [INST] ... [/INST]
+      phi3    → <|user|> ... <|end|><|assistant|>
     """
-    context   = _runtime_context_header()
-    sys_text  = f"{context}\n{system_prompt}"
-    sys_block = f"<|think|>\n{sys_text}" if thinking_mode else sys_text
+    context  = _runtime_context_header()
+    sys_text = f"{context}\n{system_prompt}"
+    fmt      = prompt_format.lower()
+
+    # Inject thinking token into system block when enabled
+    if thinking_mode:
+        if fmt == "gemma":
+            sys_text = f"<|think|>\n{sys_text}"
+        elif fmt == "chatml":
+            sys_text = f"<think>\n{sys_text}"
+        # llama3 / mistral / phi3 have no native thinking token — skip
+
+    if fmt == "chatml":
+        return (
+            f"<|im_start|>user\n"
+            f"{sys_text}\n\n"
+            f"{context}\n"
+            f"{conversation}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+    if fmt == "llama3":
+        return (
+            f"<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{sys_text}\n\n"
+            f"{context}\n"
+            f"{conversation}<|eot_id|>"
+            f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+
+    if fmt == "mistral":
+        return (
+            f"[INST] {sys_text}\n\n"
+            f"{context}\n"
+            f"{conversation} [/INST]"
+        )
+
+    if fmt == "phi3":
+        return (
+            f"<|user|>\n"
+            f"{sys_text}\n\n"
+            f"{context}\n"
+            f"{conversation}<|end|>\n"
+            f"<|assistant|>\n"
+        )
+
+    # Default: gemma
     return (
         f"<start_of_turn>user\n"
-        f"{sys_block}\n\n"
+        f"{sys_text}\n\n"
         f"{context}\n"
         f"{conversation}<end_of_turn>\n"
         f"<start_of_turn>model\n"
     )
 
 
-def _call_kobold(system_prompt, user_input, values, settings):
+def _call_kobold(system_prompt, user_input, values, settings, prompt_format="gemma"):
     """
     Fire a single generate request to Kobold. Returns the stripped response
     string, or an error string prefixed with [ERROR] on failure.
@@ -138,6 +204,8 @@ def _call_kobold(system_prompt, user_input, values, settings):
     Anti-prompts are sourced from the active model_profiles row (resolved in
     index.py and stored in the profiles array). The legacy ANTI_PROMPTS_GEMMA
     key in settings_values is no longer consulted.
+
+    prompt_format — passed through to _build_prompt for correct turn wrapping.
     """
     endpoint      = db.resolve_value(values, "ENDPOINT_KOBOLD",    "http://localhost:5001/api/v1/generate")
     max_tokens    = int(db.resolve_value(values,   "KOBOLD_MAX_TOKENS",  "512"))
@@ -145,7 +213,7 @@ def _call_kobold(system_prompt, user_input, values, settings):
     top_p         = float(db.resolve_value(values, "KOBOLD_TOP_P",       "0.9"))
     thinking_mode = db.resolve_setting(settings, "THINKING_MODE", fallback=1) == 1
 
-    prompt  = _build_prompt(system_prompt, user_input, thinking_mode)
+    prompt  = _build_prompt(system_prompt, user_input, thinking_mode, prompt_format)
     payload = json.dumps({
         "prompt":      prompt,
         "max_length":  max_tokens,
@@ -253,24 +321,55 @@ def _extract_tool_call(raw, known_functions=None):
     return None
 
 
-def _extract_gemma_thought(raw):
+def _extract_thought(raw, prompt_format="gemma"):
     """
-    Extract Gemma's internal reasoning from its thought channel block.
+    Extract the model's internal reasoning block. Format-aware.
 
-    Gemma 3/4 wraps thinking output in:
-      <|channel>thought
-      [reasoning here]
-      <channel|>
+    Gemma:  <|channel>thought ... <channel|>
+    ChatML: <think> ... </think>    (Qwen3, Hermes-think, etc.)
 
-    Returns the stripped inner content, or None if no thought block is present.
-    Handles both closed and unclosed blocks (Gemma occasionally emits the
+    Handles both closed and unclosed blocks (models occasionally emit the
     latter on error-recovery turns).
+
+    Returns the stripped inner content, or None if no thought block present.
     """
+    fmt = prompt_format.lower()
+
+    if fmt == "chatml":
+        m = re.search(r'<think>(.*?)</think>', raw, re.DOTALL | re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r'<think>(.*)', raw, re.DOTALL | re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    # Default: gemma
     m = re.search(r'<\|channel>thought\s*(.*?)\s*<channel\|>', raw, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
     m = re.search(r'<\|channel>thought\s*(.*)', raw, re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else None
+
+
+def _strip_thought_blocks(raw, prompt_format="gemma"):
+    """
+    Two-pass strip of thought blocks from model output. Format-aware.
+
+    Pass 1 — closed blocks (most common)
+    Pass 2 — unclosed tail (error-recovery fallback)
+
+    Returns the cleaned string.
+    """
+    fmt = prompt_format.lower()
+
+    if fmt == "chatml":
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL | re.IGNORECASE).strip()
+        raw = re.sub(r'<think>.*',          '', raw, flags=re.DOTALL | re.IGNORECASE).strip()
+    else:
+        # gemma (and any format without a known thought token — safe no-op)
+        raw = re.sub(r'<\|channel>thought.*?<channel\|>', '', raw, flags=re.DOTALL | re.IGNORECASE).strip()
+        raw = re.sub(r'<\|channel>thought.*',             '', raw, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    return raw
 
 
 def _parse_call_params(call_line):
@@ -388,7 +487,7 @@ def _schedule_stagger(delay_minutes, command, runtime, build_runtime_fn):
         if stripped.lower().startswith("/stagger "):
             _dispatch_stagger(stripped, live_runtime, build_runtime_fn)
         else:
-            response = _agent_turn(system_prompt, command, functions, values, settings)
+            response = _agent_turn(system_prompt, command, functions, values, settings, profiles=live_runtime[4])
             print(f"{response}\n")
 
     t = threading.Timer(delay_minutes * 60, _fire)
@@ -451,13 +550,13 @@ def _dispatch_stagger(raw_input, runtime, build_runtime_fn):
 
 MAX_SCRATCHPAD_TURNS = 12  # Hard cap — no infinite hallucination chains
 
-def _agent_turn(system_prompt, user_input, functions, values, settings):
+def _agent_turn(system_prompt, user_input, functions, values, settings, profiles=None):
     """
     Full scratchpad dispatch cycle for one user message.
 
     Each iteration:
       1. Fire Kobold (params resolved live so runtime mutations take effect).
-      2. Extract and print Gemma thought block; strip it from raw.
+      2. Extract and print thought block; strip it from raw. Format-aware.
       3. Scan for CALL: — if found, execute, append RESULT, loop.
          Fallback: model emitted <tool_call> tag instead of CALL: directive.
       4. Scan for FINAL: — if found (and no CALL:), return first answer.
@@ -470,30 +569,33 @@ def _agent_turn(system_prompt, user_input, functions, values, settings):
     turns in a row it has stalled — the scratchpad is spinning in place.
     Treat the last result as the final answer and break immediately.
     This prevents runaway loops when the model lacks a FINAL: discipline.
+
+    profiles — optional profiles array from the runtime tuple. Used to resolve
+               the active prompt_format for format-aware prompt building and
+               thought block parsing. Falls back to "gemma" if absent.
     """
     thinking_mode = db.resolve_setting(settings, "THINKING_MODE", fallback=1) == 1
     conversation  = user_input
+
+    # Resolve prompt_format from active model profile
+    active_model  = db.resolve_value(values, "ACTIVE_MODEL", fallback="GEMMA")
+    prompt_format = "gemma"
+    if profiles:
+        active_profile = db.resolve_active_profile(profiles, active_model)
+        prompt_format  = active_profile.get("prompt_format", "gemma")
 
     _last_call   = None   # (fn_name, fn_result) from the previous turn
     _stall_count = 0      # consecutive identical CALL/RESULT pairs seen
 
     for _turn in range(MAX_SCRATCHPAD_TURNS):
-        raw = _call_kobold(system_prompt, conversation, values, settings)
+        raw = _call_kobold(system_prompt, conversation, values, settings, prompt_format)
 
-        # ── 1. Extract, print, and excise Gemma thought block ────────────────
+        # ── 1. Extract, print, and excise thought block (format-aware) ────────
         if thinking_mode:
-            thought = _extract_gemma_thought(raw)
+            thought = _extract_thought(raw, prompt_format)
             if thought:
                 print(f"\n  [thinking] {thought}")
-            # Two-pass strip: closed blocks first, then any unclosed tail.
-            raw = re.sub(
-                r'<\|channel>thought.*?<channel\|>', '', raw,
-                flags=re.DOTALL | re.IGNORECASE
-            ).strip()
-            raw = re.sub(
-                r'<\|channel>thought.*', '', raw,
-                flags=re.DOTALL | re.IGNORECASE
-            ).strip()
+            raw = _strip_thought_blocks(raw, prompt_format)
 
         # ── 2. Single-pass scan for CALL: and FINAL: directives ──────────────
         call_target = None
@@ -744,7 +846,7 @@ def loop_interactive(runtime, build_runtime_fn):
             continue
 
         print("Agent > ", end="", flush=True)
-        response = _agent_turn(system_prompt, user_input, functions, values, settings)
+        response = _agent_turn(system_prompt, user_input, functions, values, settings, profiles=profiles)
 
         # Intercept agent-emitted /stagger directives — the agent reasons about
         # scheduling and emits the directive as its FINAL: answer. We catch it
@@ -783,6 +885,6 @@ def loop_stateless(runtime, build_runtime_fn):
             sys.stdout.write("[stagger] Stagger is not supported in stateless mode.\n")
             sys.stdout.flush()
             continue
-        response = _agent_turn(system_prompt, user_input, functions, values, settings)
+        response = _agent_turn(system_prompt, user_input, functions, values, settings, profiles=profiles)
         sys.stdout.write(response + "\n")
         sys.stdout.flush()

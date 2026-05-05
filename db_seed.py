@@ -215,7 +215,7 @@ SCHEMA = [
 SEED_SETTINGS = [
     # (setting_name, setting_bool)
     ("INTERACTIVE_MODE", 1),   # 0 = stateless/daemon, 1 = interactive readline
-    ("TTS",          1),   # 1 = speak Kobold responses via tts_daemon_turbo.py
+    ("TTS",          0),   # 1 = speak Kobold responses via tts_daemon_turbo.py
     ("TTS_DEBUG",    0),   # 1 = print TTS pipeline progress to console, 0 = silent
     ("STT",          0),   # enable speech to text transcription
     ("DEBUG_LOGGING",    0),   # reserved for future verbose output toggle
@@ -230,8 +230,8 @@ SEED_SETTINGS = [
 #       All anti-prompt data now lives in model_profiles, keyed by profile_name.
 #       The active profile is resolved at runtime via ACTIVE_MODEL.
 SEED_VALUES = [
-    ("ACTIVE_MODEL",       "GEMMA"),
-    ("PROMPT_FORMAT",      "gemma"),
+    ("ACTIVE_MODEL",       "QWEN"),
+    ("PROMPT_FORMAT",      "chatml"),
     ("DEFAULT_PROMPT",     "DEFAULT"),
     ("ENDPOINT_KOBOLD",    "http://localhost:5001/api/v1/generate"),
     ("ENDPOINT_OLLAMA",    "http://localhost:11434/api/generate"),
@@ -239,7 +239,7 @@ SEED_VALUES = [
     ("TTS_SPLIT_CHUNKS", "200"),
     ("TTS_VOICE_REF",    "/home/kim/projects/template/voice/keira.wav"),    # Absolute path to the voice reference WAV for Chatterbox.
     ("TTS_CHARACTER_STRIP",     "*#_~`[]"),
-    ("KOBOLD_MAX_TOKENS",  "2048"),
+    ("KOBOLD_MAX_TOKENS",  "2048"),   # thinking models burn 200-400 tokens on reasoning — never go below 1500
     ("KOBOLD_TEMPERATURE", "0.1"),
     ("KOBOLD_TOP_P",       "0.9"),
 ]
@@ -350,18 +350,20 @@ SEED_PROMPTS = [
             "════════════════════════════════════════\n"
             "CALL SYNTAX — THE ONLY VALID FORMAT\n"
             "════════════════════════════════════════\n"
-            "To invoke a function you MUST emit EXACTLY this on its own line:\n"
-            "  CALL: function_name\n\n"
-            "Some functions accept parameters on the same line:\n"
+            "To invoke a function you MUST emit EXACTLY this on its own line,\n"
+            "using a REAL function name from the roster below — nothing else:\n"
+            "  CALL: get_current_datetime\n"
+            "  CALL: list_functions\n"
             "  CALL: calculate expr=<python_expression>\n"
             "  CALL: set_boolean setting_name=<n> setting_value=<0_or_1>\n"
             "  CALL: set_value setting_name=<n> setting_value=<value>\n"
             "  CALL: run_bash_command expr=<shell_command>\n"
             "  CALL: upsert_function setting_name=<fn_name> setting_value=<python_body>\n"
             "  CALL: add_prompt setting_name=<prompt_name> setting_value=<prompt_body>\n\n"
-            "FORBIDDEN — these formats will BREAK the system, NEVER use them:\n"
-            "  <tool_call>anything</tool_call>   ← FORBIDDEN\n"
-            "  Any XML or HTML tag as a function call   ← FORBIDDEN\n\n"
+            "FORBIDDEN — these will BREAK the system, NEVER emit them:\n"
+            "  CALL: function_name           ← FORBIDDEN — this is a placeholder, not a real function\n"
+            "  <tool_call>anything</tool_call>  ← FORBIDDEN\n"
+            "  Any XML or HTML tag as a function call  ← FORBIDDEN\n\n"
 
             "EXECUTION PROTOCOL:\n"
             "The system will execute the function and return the real output as:\n"
